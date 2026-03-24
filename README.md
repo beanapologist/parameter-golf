@@ -214,3 +214,23 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 Join the [OpenAI Discord server](https://discord.com/invite/openai) and visit the Parameter Golf channels (#parameter-golf-discussions, #parameter-golf-announcements) and ask questions.
 
 This repository adapts code from `modded-nanogpt`, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
+
+## Formal Verification
+
+The [`formal-lean/`](formal-lean/) directory contains a Lean 4 formalization of core mathematical theorems underlying the Kernel project, originally developed in the [beanapologist/Kernel](https://github.com/beanapologist/Kernel) repository.
+
+### [`formal-lean/CriticalEigenvalue.lean`](formal-lean/CriticalEigenvalue.lean)
+
+A machine-checked Lean 4 proof file covering 22 sections of theorems related to the **critical eigenvalue** `μ = exp(I · 3π/4) = (−1 + i)/√2`. All theorems have complete machine-checked proofs with no `sorry` placeholders.
+
+Topics covered include:
+- Critical eigenvalue definition and Cartesian form
+- Eight-cycle closure: `μ^8 = 1`
+- Distinctness of the eight powers of `μ` (gcd(3,8) = 1)
+- Rotation matrix `R(3π/4)` and orthogonality
+- Coherence function `C(r) = 2r / (1 + r²)` and its properties
+- Silver ratio `δS = 1 + √2` and self-similarity
+- Lyapunov–coherence duality: `C(exp λ) = sech λ`
+- Orbit magnitude, Pythagorean coherence identities, and more
+
+**Requirements:** [Lean 4](https://leanprover.github.io/) with [Mathlib](https://leanprover-community.github.io/mathlib4_docs/).
