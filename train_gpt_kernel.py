@@ -280,6 +280,17 @@ def _selfcheck_kernel_constants() -> None:
 _selfcheck_kernel_constants()
 
 # ─────────────────────────────────────────────────────────────────────────────
+# FEATURE FLAGS  (env-var-gated; all default to off — baseline behavior unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Lyapunov gain: replace unbounded q_gain with sech(λ)=C(exp λ)  (§10 duality).
+_USE_LYAPUNOV_GAIN: bool = os.environ.get("USE_LYAPUNOV_GAIN", "0") == "1"
+# μ-head phase binding: rotate q,k of head h by h·MU_ANGLE  (§15 Z/8Z slots).
+_USE_MU_PHASE: bool = os.environ.get("USE_MU_PHASE", "0") == "1"
+# Slow precession: advance head phases by DELTA_PHI each step (requires USE_MU_PHASE).
+_USE_PRECESSION: bool = os.environ.get("USE_PRECESSION", "0") == "1"
+
+# ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -521,7 +532,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,q_lambda,mu_phase_gate,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -785,7 +796,23 @@ class CausalSelfAttention(nn.Module):
         self.c_v = CastedLinear(dim, kv_dim, bias=False)
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
-        self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        if _USE_LYAPUNOV_GAIN:
+            # Lyapunov duality §10: C(exp λ) = sech λ — bounded gain in (0, 1].
+            self.q_lambda = nn.Parameter(torch.zeros(num_heads, dtype=torch.float32))
+        else:
+            self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
+        if _USE_MU_PHASE:
+            # Z/8Z §15: bind head h to orbit slot h·MU_ANGLE via 2-D rotation.
+            _h = torch.arange(num_heads, dtype=torch.float32) * MU_ANGLE
+            _kv = torch.arange(num_kv_heads, dtype=torch.float32) * MU_ANGLE
+            self.register_buffer("_mu_q_cos", torch.cos(_h).reshape(1, num_heads, 1, 1), persistent=False)
+            self.register_buffer("_mu_q_sin", torch.sin(_h).reshape(1, num_heads, 1, 1), persistent=False)
+            self.register_buffer("_mu_k_cos", torch.cos(_kv).reshape(1, num_kv_heads, 1, 1), persistent=False)
+            self.register_buffer("_mu_k_sin", torch.sin(_kv).reshape(1, num_kv_heads, 1, 1), persistent=False)
+            self.mu_phase_gate = nn.Parameter(torch.tensor(0.0))
+            if _USE_PRECESSION:
+                # Slow precession §14/§21: integer step stored to preserve float32 precision.
+                self.register_buffer("_precession_step", torch.tensor(0, dtype=torch.int64), persistent=True)
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -798,7 +825,29 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        if _USE_LYAPUNOV_GAIN:
+            # sech(λ) = C(exp λ): bounded gain ∈ (0, 1] via Lyapunov duality §10.
+            q = q * (1.0 / torch.cosh(self.q_lambda)).to(dtype=q.dtype)[None, :, None, None]
+        else:
+            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        if _USE_MU_PHASE:
+            # Z/8Z §15: gated 2-D rotation per head; gate init=0 → identity by default.
+            _g = self.mu_phase_gate.to(dtype=q.dtype)
+            _half = self.head_dim // 2
+            if _USE_PRECESSION:
+                _ph = self._precession_step.float() * PRECESSION_DELTA_PHI
+                _cp, _sp = torch.cos(_ph), torch.sin(_ph)
+                _cq = (self._mu_q_cos * _cp - self._mu_q_sin * _sp).to(dtype=q.dtype)
+                _sq = (self._mu_q_sin * _cp + self._mu_q_cos * _sp).to(dtype=q.dtype)
+                _ck = (self._mu_k_cos * _cp - self._mu_k_sin * _sp).to(dtype=k.dtype)
+                _sk = (self._mu_k_sin * _cp + self._mu_k_cos * _sp).to(dtype=k.dtype)
+            else:
+                _cq, _sq = self._mu_q_cos.to(dtype=q.dtype), self._mu_q_sin.to(dtype=q.dtype)
+                _ck, _sk = self._mu_k_cos.to(dtype=k.dtype), self._mu_k_sin.to(dtype=k.dtype)
+            q1, q2 = q[..., :_half], q[..., _half:]
+            q = torch.lerp(q, torch.cat([q1 * _cq - q2 * _sq, q1 * _sq + q2 * _cq], -1), _g)
+            k1, k2 = k[..., :_half], k[..., _half:]
+            k = torch.lerp(k, torch.cat([k1 * _ck - k2 * _sk, k1 * _sk + k2 * _ck], -1), _g)
         # Expand k,v from num_kv_heads to num_heads for GQA
         k = k.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
         v = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
@@ -917,6 +966,16 @@ def _run_kernel_selftest() -> None:
         f"KERNEL_SELFTEST: mlp_hidden/model_dim must be ~δS={SILVER_RATIO:.6f}; "
         f"got {_ratio:.6f}"
     )
+
+    # μ-phase rotation preserves pair norms per Z/8Z slot (§2, §15)
+    _h_angles = torch.arange(MU_ORBIT_SIZE, dtype=torch.float32) * MU_ANGLE
+    _vecs = torch.randn(MU_ORBIT_SIZE, 8)
+    _half_d = 4
+    _ch, _sh = torch.cos(_h_angles)[:, None], torch.sin(_h_angles)[:, None]
+    _v1, _v2 = _vecs[:, :_half_d], _vecs[:, _half_d:]
+    _rv1, _rv2 = _v1 * _ch - _v2 * _sh, _v1 * _sh + _v2 * _ch
+    _norm_err = ((_v1 ** 2 + _v2 ** 2) - (_rv1 ** 2 + _rv2 ** 2)).abs().max().item()
+    assert _norm_err < _eps, f"μ-phase rotation must preserve pair norms; max err={_norm_err:.2e}"
 
     print("kernel_selftest: all checks PASSED ✓")
 
@@ -1124,6 +1183,8 @@ def main() -> None:
         f"gcd(8,D)={math.gcd(8, PRECESSION_PERIOD)} (expect 1) "
         f"D*dPhi/2pi={PRECESSION_PERIOD * PRECESSION_DELTA_PHI / (2.0 * math.pi):.10f} (expect 1.0)"
     )
+    if _USE_LYAPUNOV_GAIN or _USE_MU_PHASE:
+        log0(f"kernel:features lyapunov_gain:{int(_USE_LYAPUNOV_GAIN)} mu_phase:{int(_USE_MU_PHASE)} precession:{int(_USE_PRECESSION)}")
 
     # ── Seed + tokenizer ──────────────────────────────────────────────────────
 
@@ -1345,6 +1406,10 @@ def main() -> None:
         for opt in optimizers:
             opt.step()
         zero_grad_all()
+        if _USE_MU_PHASE and _USE_PRECESSION:
+            with torch.no_grad():
+                for _blk in base_model.blocks:
+                    _blk.attn._precession_step.add_(1)
 
         step += 1
         last_step_ms = 1000.0 * (time.perf_counter() - step_t0)
