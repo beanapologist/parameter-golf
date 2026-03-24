@@ -234,3 +234,24 @@ Topics covered include:
 - Orbit magnitude, Pythagorean coherence identities, and more
 
 **Requirements:** [Lean 4](https://leanprover.github.io/) with [Mathlib](https://leanprover-community.github.io/mathlib4_docs/).
+
+### Kernel-Informed Training Pipeline: [`train_gpt_kernel.py`](train_gpt_kernel.py)
+
+A full training pipeline for the parameter-golf challenge that directly implements three architectural choices derived from the machine-checked theorems in `CriticalEigenvalue.lean`.
+
+| Lean theorem | Implementation in `train_gpt_kernel.py` |
+|---|---|
+| Coherence function `C(r) = 2r/(1+r²)` — §5, Pythagorean identity §18, Lyapunov duality §10 | `coherence()` activation replaces `relu²` in every MLP block |
+| Silver ratio `δS = 1+√2 ≈ 2.414` — §7 Proposition 4, self-similarity §20 | MLP hidden width = `⌊δS · model_dim⌋` (≈ 2.414× instead of 2×) |
+| Z/8Z rotational memory `μ^(j+8) = μ^j` — §15, orbit distinctness §3 | Default `num_heads = 8` (one head per orbit slot) |
+
+**Quick start** (same environment as `train_gpt.py`):
+
+```bash
+RUN_ID=kernel_smoke \
+ITERATIONS=200 \
+VAL_LOSS_EVERY=0 \
+torchrun --standalone --nproc_per_node=1 train_gpt_kernel.py
+```
+
+All other flags (`DATA_PATH`, `TOKENIZER_PATH`, `VOCAB_SIZE`, `NUM_LAYERS`, etc.) are identical to `train_gpt.py`. The coherence MLP hidden size can be overridden with `MLP_HIDDEN=<int>`. The default is `round((1+√2) * MODEL_DIM)` per the silver ratio.
