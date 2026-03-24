@@ -214,3 +214,44 @@ The `train_gpt.py` and `train_gpt_mlx.py` scripts are intended as good launching
 Join the [OpenAI Discord server](https://discord.com/invite/openai) and visit the Parameter Golf channels (#parameter-golf-discussions, #parameter-golf-announcements) and ask questions.
 
 This repository adapts code from `modded-nanogpt`, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for attribution.
+
+## Formal Verification
+
+The [`formal-lean/`](formal-lean/) directory contains a Lean 4 formalization of core mathematical theorems underlying the Kernel project, originally developed in the [beanapologist/Kernel](https://github.com/beanapologist/Kernel) repository.
+
+### [`formal-lean/CriticalEigenvalue.lean`](formal-lean/CriticalEigenvalue.lean)
+
+A machine-checked Lean 4 proof file covering 22 sections of theorems related to the **critical eigenvalue** `μ = exp(I · 3π/4) = (−1 + i)/√2`. All theorems have complete machine-checked proofs with no `sorry` placeholders.
+
+Topics covered include:
+- Critical eigenvalue definition and Cartesian form
+- Eight-cycle closure: `μ^8 = 1`
+- Distinctness of the eight powers of `μ` (gcd(3,8) = 1)
+- Rotation matrix `R(3π/4)` and orthogonality
+- Coherence function `C(r) = 2r / (1 + r²)` and its properties
+- Silver ratio `δS = 1 + √2` and self-similarity
+- Lyapunov–coherence duality: `C(exp λ) = sech λ`
+- Orbit magnitude, Pythagorean coherence identities, and more
+
+**Requirements:** [Lean 4](https://leanprover.github.io/) with [Mathlib](https://leanprover-community.github.io/mathlib4_docs/).
+
+### Kernel-Informed Training Pipeline: [`train_gpt_kernel.py`](train_gpt_kernel.py)
+
+A full training pipeline for the parameter-golf challenge that directly implements three architectural choices derived from the machine-checked theorems in `CriticalEigenvalue.lean`.
+
+| Lean theorem | Implementation in `train_gpt_kernel.py` |
+|---|---|
+| Coherence function `C(r) = 2r/(1+r²)` — §5, Pythagorean identity §18, Lyapunov duality §10 | `coherence()` activation replaces `relu²` in every MLP block |
+| Silver ratio `δS = 1+√2 ≈ 2.414` — §7 Proposition 4, self-similarity §20 | MLP hidden width = `⌊δS · model_dim⌋` (≈ 2.414× instead of 2×) |
+| Z/8Z rotational memory `μ^(j+8) = μ^j` — §15, orbit distinctness §3 | Default `num_heads = 8` (one head per orbit slot) |
+
+**Quick start** (same environment as `train_gpt.py`):
+
+```bash
+RUN_ID=kernel_smoke \
+ITERATIONS=200 \
+VAL_LOSS_EVERY=0 \
+torchrun --standalone --nproc_per_node=1 train_gpt_kernel.py
+```
+
+All other flags (`DATA_PATH`, `TOKENIZER_PATH`, `VOCAB_SIZE`, `NUM_LAYERS`, etc.) are identical to `train_gpt.py`. The coherence MLP hidden size can be overridden with `MLP_HIDDEN=<int>`. The default is `round((1+√2) * MODEL_DIM)` per the silver ratio.
