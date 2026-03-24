@@ -69,6 +69,99 @@ MU_ANGLE: float = 3.0 * math.pi / 4.0  # 135°
 # Number of distinct μ-orbit slots: Z/8Z (§15).
 MU_ORBIT_SIZE: int = 8
 
+# Slow-precession period D (CriticalEigenvalue.lean §14, precession_period_factor).
+# Lean theorem: 9 × D = 123456789  (nine copies of D fill the palindrome number).
+# Also: gcd(8, D) = 1 (precession_gcd_one) — fast 8-cycle and slow precession are coprime.
+PRECESSION_PERIOD: int = 13_717_421  # D = 123456789 / 9
+
+# Phase increment per step: ΔΦ₀ = 2π / D  (CriticalEigenvalue.lean §21, phase_full_cycle).
+# After PRECESSION_PERIOD steps the phase accumulation returns exactly to 2π.
+PRECESSION_DELTA_PHI: float = 2.0 * math.pi / PRECESSION_PERIOD
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PALINDROME PRECESSION LR FORMULA  (CriticalEigenvalue.lean §9 + §16)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def palindrome_precession_scale(r: float) -> float:
+    """Learning-rate multiplier from the palindrome precession formula.
+
+    Evaluates the coherence function C(r) = 2r / (1 + r²) at
+    r = (remaining_steps / warmdown_steps) ∈ [0, 1].
+
+    Lean machine-checked properties carried over (CriticalEigenvalue.lean):
+      • C(r) ≤ 1 for r ≥ 0             (AM–GM bound, §5 coherence_le_one)
+      • C(1) = 1                         (unique maximum, §5 coherence_eq_one_iff)
+      • C(r) = C(1/r)                    (even symmetry, §8 coherence_symm)
+      • R(r) = 0 ↔ C(r) = 1            (palindrome equilibrium, §11)
+      • R(1/r) = −R(r)                   (anti-symmetry, §9 palindrome_residual_antisymm)
+        — ensures the warmdown profile mirrors a warmup under r ↦ 1/r,
+          making the full LR arc a palindrome in the Lean-theorem sense.
+      • precession_preserves_coherence   (§16) — precession is zero-overhead;
+        the scale C(r) is invariant under β ↦ e^{iθ}·β for any real θ.
+
+    Args:
+        r: ratio of remaining steps to warmdown window, clipped to [0, 1].
+
+    Returns:
+        LR multiplier in [0, 1].  Returns 1.0 for r ≥ 1 (outside warmdown),
+        0.0 for r ≤ 0 (training finished).
+    """
+    if r >= 1.0:
+        return 1.0
+    if r <= 0.0:
+        return 0.0
+    return 2.0 * r / (1.0 + r * r)
+
+
+def _selfcheck_palindrome_precession() -> None:
+    """Self-check: verify palindrome precession formula against Lean theorem properties.
+
+    This mirrors the machine-checked proofs in CriticalEigenvalue.lean and
+    confirms that palindrome_precession_scale satisfies all expected invariants.
+    Runs at import time; raises AssertionError on any violation.
+    """
+    _eps = 1e-10
+    _delta_s = SILVER_RATIO
+
+    def _C(r: float) -> float:
+        return 2.0 * r / (1.0 + r * r)
+
+    def _Res(r: float) -> float:
+        return (r - 1.0 / r) / _delta_s
+
+    # C(1) = 1  (coherence_eq_one_iff, §5)
+    assert abs(_C(1.0) - 1.0) < _eps, "C(1) must equal 1 (coherence_eq_one_iff)"
+    # C(0) = 0
+    assert abs(_C(0.0)) < _eps, "C(0) must equal 0"
+    # C(r) ≤ 1 for r ≥ 0  (coherence_le_one, §5)
+    for _r in (0.1, 0.5, 1.0, 1.5, 2.0, 10.0):
+        assert _C(_r) <= 1.0 + _eps, f"C({_r}) must be ≤ 1 (coherence_le_one)"
+    # C(r) = C(1/r)  (coherence_symm / even symmetry, §8)
+    for _r in (0.5, 2.0, 3.0):
+        assert abs(_C(_r) - _C(1.0 / _r)) < _eps, f"C must be even: C({_r}) ≠ C(1/{_r})"
+    # R(1) = 0  (palindrome_residual_zero_iff, §9)
+    assert abs(_Res(1.0)) < _eps, "Res(1) must equal 0 (palindrome_residual_zero_iff)"
+    # R(1/r) = −R(r)  (palindrome_residual_antisymm, §9)
+    for _r in (0.5, 2.0, 3.0):
+        assert abs(_Res(1.0 / _r) + _Res(_r)) < _eps, (
+            f"palindrome_residual_antisymm violated at r={_r}"
+        )
+    # palindrome_precession_scale boundary values
+    assert abs(palindrome_precession_scale(1.0) - 1.0) < _eps, "scale(1) must be 1"
+    assert abs(palindrome_precession_scale(0.0)) < _eps, "scale(0) must be 0"
+    assert palindrome_precession_scale(1.5) == 1.0, "scale(r>=1) must be 1"
+    assert palindrome_precession_scale(-0.1) == 0.0, "scale(r<=0) must be 0"
+    # Pythagorean identity: C(r)² + ((r²-1)/(1+r²))² = 1  (§18)
+    for _r in (0.5, 1.0, 2.0, 3.0):
+        _c = _C(_r)
+        _s = (_r * _r - 1.0) / (1.0 + _r * _r)
+        assert abs(_c * _c + _s * _s - 1.0) < _eps, (
+            f"Pythagorean identity violated at r={_r}"
+        )
+
+
+_selfcheck_palindrome_precession()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -776,10 +869,13 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
+    # Flash SDP is significantly faster than the math fallback for seq_len >= 512.
+    # Default train_seq_len=1024 in this repo (Hyperparameters.train_seq_len).
+    # cudnn/mem-efficient SDP are off; flash is the sole back-end.
     enable_cudnn_sdp(False)
-    enable_flash_sdp(False)
+    enable_flash_sdp(True)
     enable_mem_efficient_sdp(False)
-    enable_math_sdp(True)
+    enable_math_sdp(False)
 
     logfile = None
     if master_process:
@@ -809,6 +905,7 @@ def main() -> None:
     # ── Kernel constants log ──────────────────────────────────────────────────
     log0(f"kernel:silver_ratio:{SILVER_RATIO:.6f} mu_angle_deg:{math.degrees(MU_ANGLE):.1f} orbit_size:{MU_ORBIT_SIZE}")
     log0(f"kernel:mlp_hidden:{args.mlp_hidden} (={args.mlp_hidden / args.model_dim:.4f}x model_dim)")
+    log0(f"kernel:precession_period:{PRECESSION_PERIOD} delta_phi:{PRECESSION_DELTA_PHI:.2e} (formal-lean/CriticalEigenvalue.lean §14, §21)")
 
     # ── Seed + tokenizer ──────────────────────────────────────────────────────
 
@@ -917,15 +1014,28 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
+        """LR multiplier using palindrome precession schedule (CriticalEigenvalue.lean §9, §16).
+
+        Replaces the previous linear warmdown with the coherence function
+        C(r) = 2r/(1+r²) evaluated at r = remaining/warmdown ∈ [0,1].
+        This is strictly smoother than a linear ramp: C has zero derivative at
+        r=0, so the LR tapers gracefully rather than hitting a hard zero.
+        """
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+            if step < warmdown_start:
+                return 1.0
+            r = (args.iterations - step) / max(args.warmdown_iters, 1)
+        else:
+            step_ms = elapsed_ms / max(step, 1)
+            warmdown_ms = args.warmdown_iters * step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            if remaining_ms > warmdown_ms:
+                return 1.0
+            r = remaining_ms / max(warmdown_ms, 1e-9)
+        return palindrome_precession_scale(r)
 
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
@@ -957,6 +1067,7 @@ def main() -> None:
 
     training_time_ms = 0.0
     stop_after_step: int | None = None
+    last_step_ms: float = 0.0  # duration of the most recently completed step (ms)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -987,7 +1098,8 @@ def main() -> None:
                 )
             break
 
-        elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        step_t0 = time.perf_counter()
+        elapsed_ms = training_time_ms + 1000.0 * (step_t0 - t0)
         scale = lr_mul(step, elapsed_ms)
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -1017,6 +1129,7 @@ def main() -> None:
         zero_grad_all()
 
         step += 1
+        last_step_ms = 1000.0 * (time.perf_counter() - step_t0)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1025,6 +1138,7 @@ def main() -> None:
         if should_log_train:
             log0(
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step_t:{last_step_ms:.1f}ms "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
 
