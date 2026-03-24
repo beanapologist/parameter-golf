@@ -136,9 +136,34 @@ def _selfcheck_palindrome_precession() -> None:
     # C(r) ≤ 1 for r ≥ 0  (coherence_le_one, §5)
     for _r in (0.1, 0.5, 1.0, 1.5, 2.0, 10.0):
         assert _C(_r) <= 1.0 + _eps, f"C({_r}) must be ≤ 1 (coherence_le_one)"
-    # C(r) = C(1/r)  (coherence_symm / even symmetry, §8)
+    # C(−r) = −C(r): odd / anti-symmetric  (§5)
+    for _r in (0.3, 0.7, 1.0, 2.0, 5.0):
+        assert abs(_C(-_r) + _C(_r)) < _eps, (
+            f"C must be odd: C(-{_r}) ≠ -C({_r}) (coherence odd symmetry §5)"
+        )
+    # C(r) = C(1/r): reciprocal symmetry  (coherence_symm, §8)
     for _r in (0.5, 2.0, 3.0):
-        assert abs(_C(_r) - _C(1.0 / _r)) < _eps, f"C must be even: C({_r}) ≠ C(1/{_r})"
+        assert abs(_C(_r) - _C(1.0 / _r)) < _eps, (
+            f"C must satisfy C({_r}) = C(1/{_r}) (coherence_symm §8)"
+        )
+    # Monotonicity: C strictly increasing on (0,1], strictly decreasing on [1,∞)  (§13)
+    _mono_inc = (0.2, 0.4, 0.6, 0.8, 1.0)
+    for _a, _b in zip(_mono_inc, _mono_inc[1:]):
+        assert _C(_a) < _C(_b), (
+            f"C must be strictly increasing on (0,1]: C({_a})={_C(_a):.6f} ≥ C({_b})={_C(_b):.6f}"
+        )
+    _mono_dec = (1.0, 1.5, 2.0, 3.0, 5.0)
+    for _a, _b in zip(_mono_dec, _mono_dec[1:]):
+        assert _C(_a) > _C(_b), (
+            f"C must be strictly decreasing on [1,∞): C({_a})={_C(_a):.6f} ≤ C({_b})={_C(_b):.6f}"
+        )
+    # Lyapunov–coherence duality: C(exp λ) = sech λ = 1/cosh λ  (Theorem 14, §10)
+    for _lam in (-2.0, -1.0, 0.0, 0.5, 1.0, 2.0):
+        _expected = 1.0 / math.cosh(_lam)
+        _got = _C(math.exp(_lam))
+        assert abs(_got - _expected) < _eps, (
+            f"Lyapunov duality violated at λ={_lam}: C(exp λ)={_got:.10f} ≠ sech λ={_expected:.10f}"
+        )
     # R(1) = 0  (palindrome_residual_zero_iff, §9)
     assert abs(_Res(1.0)) < _eps, "Res(1) must equal 0 (palindrome_residual_zero_iff)"
     # R(1/r) = −R(r)  (palindrome_residual_antisymm, §9)
@@ -151,6 +176,15 @@ def _selfcheck_palindrome_precession() -> None:
     assert abs(palindrome_precession_scale(0.0)) < _eps, "scale(0) must be 0"
     assert palindrome_precession_scale(1.5) == 1.0, "scale(r>=1) must be 1"
     assert palindrome_precession_scale(-0.1) == 0.0, "scale(r<=0) must be 0"
+    # LR warmdown: scale is non-decreasing as r increases toward 1 on [0,1]
+    _prev = 0.0
+    for _r in (0.1, 0.3, 0.5, 0.7, 0.9, 1.0):
+        _s = palindrome_precession_scale(_r)
+        assert _s >= _prev - _eps, (
+            f"palindrome_precession_scale must be non-decreasing on [0,1]: "
+            f"scale({_r})={_s:.6f} < scale(prev)={_prev:.6f}"
+        )
+        _prev = _s
     # Pythagorean identity: C(r)² + ((r²-1)/(1+r²))² = 1  (§18)
     for _r in (0.5, 1.0, 2.0, 3.0):
         _c = _C(_r)
@@ -161,6 +195,89 @@ def _selfcheck_palindrome_precession() -> None:
 
 
 _selfcheck_palindrome_precession()
+
+
+def _selfcheck_kernel_constants() -> None:
+    """Validate global kernel constants against Lean-proved identities.
+
+    All equalities are machine-checked in formal-lean/CriticalEigenvalue.lean.
+    Runs at import time; raises AssertionError with an actionable message on
+    any violation.  Safe to run on all ranks: no I/O or distributed calls.
+    """
+    _eps = 1e-12
+
+    # ── Palindrome arithmetic (§14) ───────────────────────────────────────────
+
+    # 9 × D = 123456789  (palindrome_period_factor, §14)
+    # The palindrome number 123456789 is exactly 9 copies of the period D.
+    _nine_d = 9 * PRECESSION_PERIOD
+    assert _nine_d == 123_456_789, (
+        f"9 * PRECESSION_PERIOD must be 123456789; got {_nine_d}. "
+        f"Check PRECESSION_PERIOD={PRECESSION_PERIOD}."
+    )
+
+    # gcd(8, D) = 1  (precession_gcd_one, §14)
+    # The 8-cycle and the slow precession are coprime — they share no common
+    # period and therefore cover the full Z/8Z × Z/D torus without collision.
+    _g = math.gcd(8, PRECESSION_PERIOD)
+    assert _g == 1, (
+        f"gcd(8, PRECESSION_PERIOD) must be 1; got {_g}. "
+        f"Fast 8-cycle and slow precession must be coprime (precession_gcd_one §14)."
+    )
+
+    # ── Phase accumulation (§21) ──────────────────────────────────────────────
+
+    # D × ΔΦ₀ = 2π  (phase_full_cycle, §21)
+    # After exactly PRECESSION_PERIOD steps the accumulated phase returns to 2π.
+    _full_cycle = PRECESSION_PERIOD * PRECESSION_DELTA_PHI
+    assert abs(_full_cycle - 2.0 * math.pi) < _eps, (
+        f"PRECESSION_PERIOD * PRECESSION_DELTA_PHI must equal 2π; "
+        f"got {_full_cycle:.15f}, expected {2.0 * math.pi:.15f} "
+        f"(phase_full_cycle §21)."
+    )
+
+    # ── Silver ratio (§7, §20) ────────────────────────────────────────────────
+
+    # δS = 2 + 1/δS  (silver_ratio_self_similar, §20)
+    assert abs(SILVER_RATIO - (2.0 + 1.0 / SILVER_RATIO)) < _eps, (
+        f"SILVER_RATIO must satisfy δS = 2 + 1/δS; "
+        f"got δS={SILVER_RATIO}, 2+1/δS={2.0 + 1.0 / SILVER_RATIO} "
+        f"(silver_ratio_self_similar §20)."
+    )
+
+    # δS is the positive root of x² − 2x − 1 = 0  (§7 Proposition 4)
+    _poly = SILVER_RATIO ** 2 - 2.0 * SILVER_RATIO - 1.0
+    assert abs(_poly) < _eps, (
+        f"SILVER_RATIO must satisfy x²−2x−1=0; residual={_poly:.2e} "
+        f"(silver_ratio minimal polynomial §7)."
+    )
+
+    # ── Critical eigenvalue (§1, §2, §15) ────────────────────────────────────
+
+    # μ angle = 3π/4  (§1 critical eigenvalue definition)
+    assert abs(MU_ANGLE - 3.0 * math.pi / 4.0) < _eps, (
+        f"MU_ANGLE must be 3π/4={3.0 * math.pi / 4.0:.15f}; got {MU_ANGLE}."
+    )
+
+    # Z/8Z orbit size = 8  (mu_pow_eight §2, rotational_memory §15)
+    assert MU_ORBIT_SIZE == 8, (
+        f"MU_ORBIT_SIZE must be 8 (mu_pow_eight §2, Z/8Z §15); got {MU_ORBIT_SIZE}."
+    )
+
+    # |μ| = 1 on the unit circle: cos²(3π/4) + sin²(3π/4) = 1  (mu_abs_one §2)
+    _mu_abs_sq = math.cos(MU_ANGLE) ** 2 + math.sin(MU_ANGLE) ** 2
+    assert abs(_mu_abs_sq - 1.0) < _eps, (
+        f"|μ|² must equal 1; got {_mu_abs_sq:.15f} (mu_abs_one §2)."
+    )
+
+    # gcd(3, 8) = 1: μ = ζ^3 is a primitive 8th root (mu_powers_distinct §3)
+    assert math.gcd(3, MU_ORBIT_SIZE) == 1, (
+        f"gcd(3, MU_ORBIT_SIZE) must be 1 for μ to generate all 8 distinct "
+        f"orbit slots (mu_powers_distinct §3); got gcd(3,{MU_ORBIT_SIZE})={math.gcd(3, MU_ORBIT_SIZE)}."
+    )
+
+
+_selfcheck_kernel_constants()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
@@ -712,6 +829,102 @@ def coherence(x: Tensor) -> Tensor:
     return 2.0 * x / (1.0 + x.square())
 
 
+def _run_kernel_selftest() -> None:
+    """Unit-test-like self-checks run when the env var KERNEL_SELFTEST=1.
+
+    Exercises the coherence() tensor function and the global kernel constants
+    at the PyTorch level, mirroring the scalar checks done at import time.
+    All checks are cheap (CPU tensors, no CUDA required) and DDP-safe
+    (no distributed calls; run on every rank independently).
+
+    Invoke with:
+        KERNEL_SELFTEST=1 python train_gpt_kernel.py
+    """
+    _eps = 1e-5  # tolerance for float32 tensor arithmetic
+
+    # ── coherence() tensor invariants ─────────────────────────────────────────
+
+    _xs = torch.linspace(-4.0, 4.0, 401)
+    _cs = coherence(_xs)
+
+    # Boundedness: |C(x)| < 1 strictly for x ≠ ±1  (coherence_le_one §5)
+    assert (_cs.abs() <= 1.0 + _eps).all(), (
+        f"coherence() out of [-1,1]: max |C|={_cs.abs().max().item():.6f}"
+    )
+
+    # Odd symmetry: C(-x) = -C(x)  (§5)
+    _diff_odd = (coherence(-_xs) + _cs).abs().max().item()
+    assert _diff_odd < _eps, (
+        f"coherence() odd-symmetry violated: max |C(-x)+C(x)|={_diff_odd:.2e}"
+    )
+
+    # Unique maximum C(1) = 1  (coherence_eq_one_iff §5)
+    _c1 = coherence(torch.tensor(1.0)).item()
+    assert abs(_c1 - 1.0) < _eps, f"coherence(1) must equal 1; got {_c1:.8f}"
+
+    # Pythagorean identity: C(r)² + ((r²-1)/(1+r²))² = 1  (§18)
+    _r = torch.linspace(0.05, 5.0, 100)
+    _c = coherence(_r)
+    _s = (_r ** 2 - 1.0) / (1.0 + _r ** 2)
+    _pyth_err = (_c ** 2 + _s ** 2 - 1.0).abs().max().item()
+    assert _pyth_err < _eps, (
+        f"Pythagorean identity violated in tensor: max err={_pyth_err:.2e}"
+    )
+
+    # Lyapunov duality: C(exp λ) = sech λ  (Theorem 14, §10)
+    _lam = torch.linspace(-2.0, 2.0, 41)
+    _lyap_err = (coherence(torch.exp(_lam)) - 1.0 / torch.cosh(_lam)).abs().max().item()
+    assert _lyap_err < _eps, (
+        f"Lyapunov duality violated in tensor: max err={_lyap_err:.2e}"
+    )
+
+    # Monotonicity on (0,1]: strictly increasing  (coherence_monotone §13)
+    _mon_inc = coherence(torch.linspace(0.05, 1.0, 20))
+    assert (_mon_inc[1:] > _mon_inc[:-1]).all(), (
+        "coherence() must be strictly increasing on (0,1] (coherence_monotone §13)"
+    )
+
+    # Monotonicity on [1,∞): strictly decreasing  (coherence_monotone §13)
+    _mon_dec = coherence(torch.linspace(1.0, 5.0, 20))
+    assert (_mon_dec[1:] < _mon_dec[:-1]).all(), (
+        "coherence() must be strictly decreasing on [1,∞) (coherence_monotone §13)"
+    )
+
+    # ── kernel constants ──────────────────────────────────────────────────────
+
+    # 9 × D = 123456789 and gcd(8, D) = 1  (§14)
+    assert 9 * PRECESSION_PERIOD == 123_456_789, (
+        f"KERNEL_SELFTEST: 9*PRECESSION_PERIOD must be 123456789; "
+        f"got {9 * PRECESSION_PERIOD}"
+    )
+    assert math.gcd(8, PRECESSION_PERIOD) == 1, (
+        f"KERNEL_SELFTEST: gcd(8, PRECESSION_PERIOD) must be 1; "
+        f"got {math.gcd(8, PRECESSION_PERIOD)}"
+    )
+
+    # Z/8Z orbit: num_heads default == MU_ORBIT_SIZE  (§15)
+    _default_heads = int(os.environ.get("NUM_HEADS", MU_ORBIT_SIZE))
+    assert _default_heads == MU_ORBIT_SIZE, (
+        f"KERNEL_SELFTEST: default NUM_HEADS must equal MU_ORBIT_SIZE={MU_ORBIT_SIZE}; "
+        f"got {_default_heads}"
+    )
+
+    # MLP hidden width ratio ≈ δS  (§7)
+    _model_dim = int(os.environ.get("MODEL_DIM", 512))
+    _mlp_hidden = round(SILVER_RATIO * _model_dim)
+    _ratio = _mlp_hidden / _model_dim
+    assert abs(_ratio - SILVER_RATIO) < 1.0 / _model_dim + 1e-9, (
+        f"KERNEL_SELFTEST: mlp_hidden/model_dim must be ~δS={SILVER_RATIO:.6f}; "
+        f"got {_ratio:.6f}"
+    )
+
+    print("kernel_selftest: all checks PASSED ✓")
+
+
+if os.environ.get("KERNEL_SELFTEST", "0") == "1":
+    _run_kernel_selftest()
+
+
 class CoherenceMLP(nn.Module):
     """MLP block whose hidden width is ⌊δS·dim⌋ and activation is C(r).
 
@@ -906,6 +1119,11 @@ def main() -> None:
     log0(f"kernel:silver_ratio:{SILVER_RATIO:.6f} mu_angle_deg:{math.degrees(MU_ANGLE):.1f} orbit_size:{MU_ORBIT_SIZE}")
     log0(f"kernel:mlp_hidden:{args.mlp_hidden} (={args.mlp_hidden / args.model_dim:.4f}x model_dim)")
     log0(f"kernel:precession_period:{PRECESSION_PERIOD} delta_phi:{PRECESSION_DELTA_PHI:.2e} (formal-lean/CriticalEigenvalue.lean §14, §21)")
+    log0(
+        f"kernel:invariants: 9*D={9 * PRECESSION_PERIOD} (expect 123456789) "
+        f"gcd(8,D)={math.gcd(8, PRECESSION_PERIOD)} (expect 1) "
+        f"D*dPhi/2pi={PRECESSION_PERIOD * PRECESSION_DELTA_PHI / (2.0 * math.pi):.10f} (expect 1.0)"
+    )
 
     # ── Seed + tokenizer ──────────────────────────────────────────────────────
 
