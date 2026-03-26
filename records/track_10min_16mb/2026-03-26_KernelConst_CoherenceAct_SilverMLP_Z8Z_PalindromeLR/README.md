@@ -191,4 +191,4 @@ logs once the run has been executed.
 | `train_gpt.py` | Full training + quantization + evaluation script |
 | `README.md` | This file |
 | `submission.json` | Leaderboard metadata |
-| `logs/train_seed1337.log` | Placeholder log (seed 1337) |
+| `train_seed1337.log` | Placeholder log (seed 1337) — the script writes runtime logs to `logs/<run_id>.txt` |
