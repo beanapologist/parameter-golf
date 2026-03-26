@@ -17,5 +17,9 @@
   "num_runs": 3,
   "seeds": [1337, 42, 2025],
   "significance_methodology": "One-sided paired t-test (df=2) over 3 seeds at p<0.01; t-threshold=6.965. Null hypothesis: mean val_bpb improvement vs prior SOTA <= 0. Rejected when mean_delta / (std / sqrt(3)) > 6.965, or equivalently when all three seeds individually beat prior SOTA by >= 0.005 nats.",
-  "blurb": "Wires three formal-Lean-4-verified kernel constants from formal-lean/CriticalEigenvalue.lean directly into the model: (1) Coherence activation C(r)=2r/(1+r²) replaces relu² in every MLP block; (2) Silver ratio δS=1+√2≈2.414 sets the MLP hidden-dimension multiplier; (3) Z/8Z head binding sets NUM_HEADS=MU_ORBIT_SIZE=8 so each head occupies one distinct μ-orbit slot. The warmdown LR also uses the coherence function (palindrome-precession schedule)."
+  "lean_theorems": [
+    "formal-lean/CriticalEigenvalue.lean: mu_pow_eight, silver_ratio_self_similar, coherence_eq_one_iff",
+    "formal-lean/Quantization.lean: lead_quantization_confirmed (Q1.2 quant_phase_eight_cycle, Q3.1 quant_floquet_phase, Q4.1 quant_amplitude_balance, Q4.3 quant_amplitude_coherence_max, Q2.2 quant_energy_ground)"
+  ],
+  "blurb": "Wires formal-Lean-4-verified kernel constants from CriticalEigenvalue.lean and Quantization.lean into the model. Architecture: (1) Coherence activation C(r)=2r/(1+r²) replaces relu² in every MLP block; (2) Silver ratio δS=1+√2≈2.414 sets the MLP hidden-dimension multiplier; (3) Z/8Z head binding sets NUM_HEADS=MU_ORBIT_SIZE=8 so each head occupies one distinct μ-orbit slot; (4) palindrome-precession warmdown LR uses the same coherence function. New in this revision: (5) 8-cycle closure quantization regularizer L(θ)=λ·(1−cos(8θ)) from Quantization.lean lead_quantization_confirmed (μ^8=1, Q1.2), disabled by default (USE_QUANT_REGULARIZER=1 to enable, QUANT_LAMBDA to set weight)."
 }

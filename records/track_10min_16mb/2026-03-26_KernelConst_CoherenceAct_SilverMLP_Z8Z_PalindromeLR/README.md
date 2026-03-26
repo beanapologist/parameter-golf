@@ -4,9 +4,9 @@
 
 ## Summary of Changes vs Baseline
 
-This submission wires three mathematical objects derived from the formal Lean 4 theorems in
-`formal-lean/CriticalEigenvalue.lean` directly into the model architecture and learning-rate
-schedule:
+This submission wires mathematical objects derived from the formal Lean 4 theorems in
+`formal-lean/CriticalEigenvalue.lean` and `formal-lean/Quantization.lean` directly into the
+model architecture and learning-rate schedule:
 
 | Component | Baseline | This submission |
 |-----------|----------|-----------------|
@@ -14,7 +14,8 @@ schedule:
 | MLP hidden width multiplier | 3× model_dim | Silver ratio δS ≈ 2.414 × model_dim |
 | Number of attention heads | 8 (arbitrary) | 8 (Z/8Z — each head occupies one μ-orbit slot) |
 | Warmdown LR shape | cosine | Palindrome-precession C(r) = 2r/(1+r²) |
-| Feature flags (disabled by default) | — | USE_LYAPUNOV_GAIN, USE_MU_PHASE, USE_PRECESSION |
+| Quantization regularizer | — | 8-cycle closure loss λ·(1−cos(8θ)) from Quantization.lean |
+| Feature flags (disabled by default) | — | USE_LYAPUNOV_GAIN, USE_MU_PHASE, USE_PRECESSION, USE_QUANT_REGULARIZER |
 
 ### 1. Coherence Activation  C(r) = 2r / (1 + r²)
 
@@ -47,6 +48,37 @@ The warmdown uses the same coherence function C(r) evaluated at
 C(r) = C(1/r) (palindrome symmetry) so the warmdown mirrors a warmup under r ↦ 1/r,
 making the full LR arc palindromic in the sense of the Lean theorems (§9, §11, §16).
 
+### 5. 8-Cycle Closure Quantization Regularizer  (USE_QUANT_REGULARIZER=1)
+
+Integrates `formal-lean/Quantization.lean`'s machine-checked capstone theorem
+`lead_quantization_confirmed` into the BPB training loss.  The core condition mapped to
+training is **μ^8 = 1** (Q1.2, `quant_phase_eight_cycle`).
+
+A learnable scalar parameter `quant_phase_theta` (θ, initialised to `MU_ANGLE = 3π/4`) is
+added to `KernelGPT`.  The differentiable penalty
+
+    L_quant(θ) = λ · (1 − cos(8θ))
+
+is added to the cross-entropy loss at every training step.  The penalty is:
+
+- **zero** at every 8th root of unity θ = k·π/4 for k = 0, …, 7 (the 8 distinct phases proved
+  distinct in Q1.4 `quant_phase_eight_distinct`)
+- **maximum 2** at midpoints θ = (2k+1)·π/8 between fixed points
+- initialised to **zero** because `MU_ANGLE = 3π/4` is already a fixed point (k=3)
+
+The five conditions of `lead_quantization_confirmed` mapped to Python:
+
+| Lean theorem | Condition | Python |
+|---|---|---|
+| Q1.2 `quant_phase_eight_cycle` | μ^8 = 1 | `cos(8θ) == 1` ↔ `L_quant(θ) == 0` |
+| Q3.1 `quant_floquet_phase` | ε_F·T = π | `FLOQUET_PHASE = math.pi` |
+| Q4.1 `quant_amplitude_balance` | 2η² = 1 | `ETA_SQUARED = 0.5` |
+| Q4.3 `quant_amplitude_coherence_max` | C(1) = 1 | verified in `_selfcheck_quantization_spec()` |
+| Q2.2 `quant_energy_ground` | E₁ = −1 | verified in `_selfcheck_quantization_spec()` |
+
+The regularizer is **disabled by default** (zero impact on baseline runs); enable it with
+`USE_QUANT_REGULARIZER=1` and tune its weight with `QUANT_LAMBDA` (default `0.01`).
+
 ### Tokenizer / Dataset
 
 **Unchanged.**  The tokenizer and dataset are identical to the baseline:
@@ -75,6 +107,24 @@ DATA_PATH=../../../data/datasets/fineweb10B_sp1024 \
 TOKENIZER_PATH=../../../data/tokenizers/fineweb_1024_bpe.model \
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
+
+To additionally enable the **8-cycle closure quantization regularizer** (Quantization.lean §1 Q1.2):
+
+```bash
+NUM_LAYERS=9 \
+ITERATIONS=9000 WARMDOWN_ITERS=3000 MAX_WALLCLOCK_SECONDS=600 \
+MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035 \
+MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92 \
+MUON_MOMENTUM_WARMUP_STEPS=1500 \
+USE_QUANT_REGULARIZER=1 QUANT_LAMBDA=0.01 \
+SEED=1337 \
+DATA_PATH=../../../data/datasets/fineweb10B_sp1024 \
+TOKENIZER_PATH=../../../data/tokenizers/fineweb_1024_bpe.model \
+torchrun --standalone --nproc_per_node=8 ../../../train_gpt_kernel.py
+```
+
+Note: the quantization regularizer is implemented in `train_gpt_kernel.py` (the root-level
+script); `train_gpt.py` in this folder is the historical snapshot of the original run.
 
 The script writes a log file to `logs/<run_id>.txt` (printed as the first line of stdout).
 Run twice more with `SEED=42` and `SEED=2025` to produce the three replicate logs needed for
@@ -124,6 +174,8 @@ All other imports are from the Python standard library.
 | `USE_LYAPUNOV_GAIN` | `0` | Scale QK dot-products by Lyapunov gain from §10 |
 | `USE_MU_PHASE` | `0` | Initialise each head's RoPE phase from μ-orbit slot |
 | `USE_PRECESSION` | `0` | Enable slow precession via PRECESSION_DELTA_PHI per step |
+| `USE_QUANT_REGULARIZER` | `0` | Add 8-cycle closure loss λ·(1−cos(8θ)) to BPB loss (Quantization.lean §1 Q1.2) |
+| `QUANT_LAMBDA` | `0.01` | Weight of the quantization regularizer (only active when `USE_QUANT_REGULARIZER=1`) |
 | `KERNEL_SELFTEST` | `0` | Run built-in kernel-constant unit tests and exit |
 
 ### Training schedule
@@ -152,12 +204,15 @@ The script writes one log file per process-group to `logs/<run_id>.txt`.  Key li
 ```
 logs/<run-id>.txt               # first line: path to log file
 kernel:silver_ratio:2.414214 …  # kernel constants in effect
+kernel:quant_regularizer:…      # quantization regularizer config (when USE_QUANT_REGULARIZER=1)
 train_loader:dataset:…          # dataset confirmed
 val_loader:shards …             # validation shard count and token count
 model_params:…                  # total parameter count
 warmup_step:N/20                # LR warmup progress
 step:N/ITERS train_loss:… step_t:…ms train_time:…ms step_avg:…ms
                                 # periodic train loss (every TRAIN_LOG_EVERY=200 steps)
+quant:theta:… cycle_loss:… weighted:…
+                                # 8-cycle phase and regularizer value (when USE_QUANT_REGULARIZER=1)
 step:N/ITERS val_loss:… val_bpb:… train_time:…ms
                                 # validation checkpoint (every VAL_LOSS_EVERY=1000 steps)
 stopping_early: wallclock_cap   # emitted when MAX_WALLCLOCK_SECONDS is reached
