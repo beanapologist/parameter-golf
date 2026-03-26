@@ -1,0 +1,21 @@
+{
+  "name": "Kernel Constants: Coherence Activation + Silver-Ratio MLP + Z/8Z Heads + Palindrome LR",
+  "author": "beanapologist",
+  "github_id": "beanapologist",
+  "date": "2026-03-26",
+  "val_bpb": null,
+  "val_loss_nats": null,
+  "val_metrics_note": "Placeholder — update with mean val_bpb from 3-seed runs (seeds 1337, 42, 2025) before final submission.",
+  "hardware": "8xH100",
+  "runtime_minutes": 10,
+  "commit": "ba6fdf7ff26824a156527566655a64150e91bfb0",
+  "script": "records/track_10min_16mb/2026-03-26_KernelConst_CoherenceAct_SilverMLP_Z8Z_PalindromeLR/train_gpt.py",
+  "dataset": "fineweb10B_sp1024",
+  "tokenizer": "fineweb_1024_bpe.model",
+  "tokenizer_unchanged": true,
+  "dataset_unchanged": true,
+  "num_runs": 3,
+  "seeds": [1337, 42, 2025],
+  "significance_methodology": "One-sided paired t-test (df=2) over 3 seeds at p<0.01; t-threshold=6.965. Null hypothesis: mean val_bpb improvement vs prior SOTA <= 0. Rejected when mean_delta / (std / sqrt(3)) > 6.965, or equivalently when all three seeds individually beat prior SOTA by >= 0.005 nats.",
+  "blurb": "Wires three formal-Lean-4-verified kernel constants from formal-lean/CriticalEigenvalue.lean directly into the model: (1) Coherence activation C(r)=2r/(1+r²) replaces relu² in every MLP block; (2) Silver ratio δS=1+√2≈2.414 sets the MLP hidden-dimension multiplier; (3) Z/8Z head binding sets NUM_HEADS=MU_ORBIT_SIZE=8 so each head occupies one distinct μ-orbit slot. The warmdown LR also uses the coherence function (palindrome-precession schedule)."
+}
