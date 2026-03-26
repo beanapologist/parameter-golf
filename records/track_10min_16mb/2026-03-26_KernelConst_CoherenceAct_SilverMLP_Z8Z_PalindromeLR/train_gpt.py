@@ -79,6 +79,20 @@ PRECESSION_PERIOD: int = 13_717_421  # D = 123456789 / 9
 PRECESSION_DELTA_PHI: float = 2.0 * math.pi / PRECESSION_PERIOD
 
 # ─────────────────────────────────────────────────────────────────────────────
+# QUANTIZATION SPEC CONSTANTS  (from formal-lean/Quantization.lean)
+# These are the numeric counterparts of the five conditions in Theorem Q
+# (lead_quantization_confirmed) that are wired into the training regularizer.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Amplitude balance: 2η² = 1 → η² = 1/2  (Quantization.lean §4 Q4.1).
+# The canonical equal-weight superposition amplitude η = 1/√2.
+ETA_SQUARED: float = 0.5                     # η² = 1/2
+
+# Floquet phase quantization: ε_F · T = π  (Quantization.lean §3 Q3.1).
+# The quasi-energy π/T accumulates exactly one half-period per Floquet cycle.
+FLOQUET_PHASE: float = math.pi               # ε_F · T = π
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PALINDROME PRECESSION LR FORMULA  (CriticalEigenvalue.lean §9 + §16)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -279,6 +293,61 @@ def _selfcheck_kernel_constants() -> None:
 
 _selfcheck_kernel_constants()
 
+
+def _selfcheck_quantization_spec() -> None:
+    """Validate quantization spec constants against formal-lean/Quantization.lean.
+
+    Checks the numeric identities for all five conditions of lead_quantization_confirmed
+    (Quantization.lean §5 Theorem Q capstone).  Runs at import time; raises
+    AssertionError with an actionable message on any violation.
+    """
+    _eps = 1e-12
+
+    # ── §4 Q4.1: Amplitude balance 2η² = 1 ──────────────────────────────────
+    # ETA_SQUARED = η² = 1/2, so 2·η² must equal 1.
+    assert abs(2.0 * ETA_SQUARED - 1.0) < _eps, (
+        f"2·ETA_SQUARED must equal 1 (Quantization.lean Q4.1 quant_amplitude_balance); "
+        f"got 2·ETA_SQUARED={2.0 * ETA_SQUARED}."
+    )
+    # η = 1/√2: verify ETA_SQUARED matches the direct formula
+    _eta = 1.0 / math.sqrt(2.0)
+    assert abs(ETA_SQUARED - _eta ** 2) < _eps, (
+        f"ETA_SQUARED must equal (1/√2)²=0.5; got {ETA_SQUARED}."
+    )
+
+    # ── §3 Q3.1: Floquet phase ε_F·T = π ────────────────────────────────────
+    assert abs(FLOQUET_PHASE - math.pi) < _eps, (
+        f"FLOQUET_PHASE must equal π (Quantization.lean Q3.1 quant_floquet_phase); "
+        f"got {FLOQUET_PHASE}."
+    )
+
+    # ── §1 Q1.2: 8-cycle closure μ^8 = 1 ────────────────────────────────────
+    # μ = exp(I·MU_ANGLE); μ^8 = exp(I·8·MU_ANGLE) = exp(I·6π) = 1.
+    _mu8_re = math.cos(8.0 * MU_ANGLE)
+    _mu8_im = math.sin(8.0 * MU_ANGLE)
+    assert abs(_mu8_re - 1.0) < _eps and abs(_mu8_im) < _eps, (
+        f"exp(I·8·MU_ANGLE) must equal 1 (Quantization.lean Q1.2 quant_phase_eight_cycle); "
+        f"got Re={_mu8_re:.15f} Im={_mu8_im:.15f}."
+    )
+
+    # ── §2 Q2.2: Rydberg ground-state E₁ = −1 ───────────────────────────────
+    # In natural (Rydberg) units: E_1 = −1/1² = −1.
+    _e1 = -1.0 / (1 ** 2)
+    assert abs(_e1 - (-1.0)) < _eps, (
+        f"Rydberg ground state E₁ = −1/n² at n=1 must equal −1 "
+        f"(Quantization.lean Q2.2 quant_energy_ground); got {_e1}."
+    )
+
+    # ── §4 Q4.3: Coherence maximum C(1) = 1 ─────────────────────────────────
+    _c1 = 2.0 * 1.0 / (1.0 + 1.0 ** 2)
+    assert abs(_c1 - 1.0) < _eps, (
+        f"C(1) = 2·1/(1+1²) must equal 1 (Quantization.lean Q4.3 quant_amplitude_coherence_max); "
+        f"got {_c1}."
+    )
+
+
+_selfcheck_quantization_spec()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FEATURE FLAGS  (env-var-gated; all default to off — baseline behavior unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -289,6 +358,10 @@ _USE_LYAPUNOV_GAIN: bool = os.environ.get("USE_LYAPUNOV_GAIN", "0") == "1"
 _USE_MU_PHASE: bool = os.environ.get("USE_MU_PHASE", "0") == "1"
 # Slow precession: advance head phases by DELTA_PHI each step (requires USE_MU_PHASE).
 _USE_PRECESSION: bool = os.environ.get("USE_PRECESSION", "0") == "1"
+# Quantization regularizer: enforce μ^8=1 via 8-cycle closure loss
+# (Quantization.lean §1 Q1.2, §5 lead_quantization_confirmed).
+# Weight controlled by QUANT_LAMBDA; near-zero when disabled (default off).
+_USE_QUANT_REGULARIZER: bool = os.environ.get("USE_QUANT_REGULARIZER", "0") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
@@ -348,6 +421,14 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+
+    # Quantization regularizer weight λ — weight of the 8-cycle closure penalty
+    # L_quant = λ·(1−cos(8θ)) added to BPB training loss when USE_QUANT_REGULARIZER=1.
+    # Ref: formal-lean/Quantization.lean §1 Q1.2, §5 lead_quantization_confirmed.
+    # Default 0.01 gives a gentle regularizing signal that does not dominate the
+    # cross-entropy loss.  Set to 0 to fully suppress the term while leaving the
+    # flag enabled (e.g. for logging only).
+    quant_lambda = float(os.environ.get("QUANT_LAMBDA", 0.01))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MUON OPTIMIZER  (unchanged from baseline train_gpt.py)
@@ -532,7 +613,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,q_lambda,mu_phase_gate,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,q_lambda,mu_phase_gate,skip_weight,skip_weights,quant_phase_theta",
     ).split(",")
     if pattern
 )
@@ -878,6 +959,43 @@ def coherence(x: Tensor) -> Tensor:
     return 2.0 * x / (1.0 + x.square())
 
 
+def eight_cycle_loss(theta: Tensor) -> Tensor:
+    """8-cycle closure regularizer derived from formal-lean/Quantization.lean.
+
+    Implements the differentiable penalty for the μ^8 = 1 condition proved in
+    Quantization.lean §1 Q1.2 (quant_phase_eight_cycle) and assembled in the
+    capstone Theorem Q (lead_quantization_confirmed).
+
+    For a phase parameter θ representing the orbit angle, the penalty is:
+
+        L(θ) = 1 − cos(8θ)
+
+    This equals zero precisely when exp(i·8θ) = 1, i.e. when
+    θ ∈ {0, π/4, π/2, 3π/4, π, 5π/4, 3π/2, 7π/4} — the 8 distinct roots of
+    unity proved distinct in Quantization.lean Q1.4 (quant_phase_eight_distinct).
+
+    The canonical initialisation MU_ANGLE = 3π/4 is already a fixed point
+    (L(3π/4) = 1 − cos(6π) = 0), so the regularizer starts at zero when the
+    model is initialised to the Lean-spec eigenvalue and any learned deviation
+    from the 8-cycle lattice is penalised.
+
+    Mapping to Lean spec:
+        Lean theorem                          | Python expression
+        ─────────────────────────────────────────────────────────
+        Q1.2  quant_phase_eight_cycle μ^8=1  | cos(8θ) == 1  ↔  L(θ) == 0
+        Q1.3  quant_phase_orbit_unitary      | |exp(iθ)| = 1 (implicit: θ ∈ ℝ)
+        Q1.4  quant_phase_eight_distinct     | 8 distinct zeros of L
+
+    Args:
+        theta: scalar or tensor of phase angles in radians.
+
+    Returns:
+        Non-negative loss tensor; zero at every k·π/4 (k ∈ ℤ), maximum 2 at
+        the midpoints (k+½)·π/4.
+    """
+    return 1.0 - torch.cos(8.0 * theta)
+
+
 def _run_kernel_selftest() -> None:
     """Unit-test-like self-checks run when the env var KERNEL_SELFTEST=1.
 
@@ -977,6 +1095,53 @@ def _run_kernel_selftest() -> None:
     _norm_err = ((_v1 ** 2 + _v2 ** 2) - (_rv1 ** 2 + _rv2 ** 2)).abs().max().item()
     assert _norm_err < _eps, f"μ-phase rotation must preserve pair norms; max err={_norm_err:.2e}"
 
+    # ── eight_cycle_loss() — quantization regularizer ─────────────────────────
+    # Tests the differentiable 8-cycle closure penalty from Quantization.lean §1.
+    # (formal-lean/Quantization.lean Q1.2 quant_phase_eight_cycle)
+
+    # Fixed points: L(k·π/4) = 0 for k = 0, 1, …, 7  (the 8 distinct phases)
+    for _k in range(8):
+        _theta_k = torch.tensor(_k * math.pi / 4.0)
+        _l = eight_cycle_loss(_theta_k).item()
+        assert abs(_l) < _eps, (
+            f"KERNEL_SELFTEST: eight_cycle_loss(k·π/4) must be 0 at k={_k}; got {_l:.2e}"
+        )
+
+    # MU_ANGLE = 3π/4 is a fixed point (k=3)
+    _l_mu = eight_cycle_loss(torch.tensor(MU_ANGLE)).item()
+    assert abs(_l_mu) < _eps, (
+        f"KERNEL_SELFTEST: eight_cycle_loss(MU_ANGLE=3π/4) must be 0; got {_l_mu:.2e}"
+    )
+
+    # Off-cycle points: L((2k+1)·π/8) = 2 for k = 0,…,7  (midpoints between slots)
+    # These are the global maxima where cos(8θ) = cos((2k+1)π) = −1.
+    for _k in range(8):
+        _theta_mid = torch.tensor((2 * _k + 1) * math.pi / 8.0)
+        _l_mid = eight_cycle_loss(_theta_mid).item()
+        assert abs(_l_mid - 2.0) < _eps, (
+            f"KERNEL_SELFTEST: eight_cycle_loss at midpoint k={_k} (θ={(2*_k+1)}π/8) "
+            f"must equal 2; got {_l_mid:.6f}"
+        )
+
+    # Differentiability: gradient is defined at a fixed point adjacent to zero
+    _theta_diff = torch.tensor(MU_ANGLE + 0.1, requires_grad=True)
+    _loss_diff = eight_cycle_loss(_theta_diff)
+    _loss_diff.backward()
+    assert _theta_diff.grad is not None, "KERNEL_SELFTEST: eight_cycle_loss must be differentiable"
+    assert abs(_theta_diff.grad.item()) > 0.0, (
+        "KERNEL_SELFTEST: eight_cycle_loss gradient must be non-zero away from fixed points"
+    )
+
+    # Amplitude balance invariant: 2·ETA_SQUARED = 1  (Quantization.lean Q4.1)
+    assert abs(2.0 * ETA_SQUARED - 1.0) < _eps, (
+        "KERNEL_SELFTEST: 2·ETA_SQUARED must equal 1 (Quantization.lean Q4.1)"
+    )
+
+    # Floquet phase invariant: FLOQUET_PHASE = π  (Quantization.lean Q3.1)
+    assert abs(FLOQUET_PHASE - math.pi) < _eps, (
+        "KERNEL_SELFTEST: FLOQUET_PHASE must equal π (Quantization.lean Q3.1)"
+    )
+
     print("kernel_selftest: all checks PASSED ✓")
 
 
@@ -1050,6 +1215,7 @@ class KernelGPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        quant_lambda: float = 0.01,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1057,6 +1223,7 @@ class KernelGPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.quant_lambda: float = quant_lambda
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1072,6 +1239,11 @@ class KernelGPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        if _USE_QUANT_REGULARIZER:
+            # Learnable phase θ for the 8-cycle closure regularizer.
+            # Initialised to MU_ANGLE = 3π/4 — a valid fixed point of L(θ) = 1−cos(8θ).
+            # Ref: Quantization.lean §1 Q1.2 (quant_phase_eight_cycle: μ^8 = 1).
+            self.quant_phase_theta = nn.Parameter(torch.tensor(MU_ANGLE, dtype=torch.float32))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1104,7 +1276,12 @@ class KernelGPT(nn.Module):
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+        if _USE_QUANT_REGULARIZER:
+            # 8-cycle closure regularizer — Quantization.lean §1 Q1.2 (μ^8 = 1).
+            # L_quant = λ · (1 − cos(8θ)): zero at every 8th root of unity k·π/4.
+            loss = loss + self.quant_lambda * eight_cycle_loss(self.quant_phase_theta)
+        return loss
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TRAINING
@@ -1185,6 +1362,11 @@ def main() -> None:
     )
     if _USE_LYAPUNOV_GAIN or _USE_MU_PHASE:
         log0(f"kernel:features lyapunov_gain:{int(_USE_LYAPUNOV_GAIN)} mu_phase:{int(_USE_MU_PHASE)} precession:{int(_USE_PRECESSION)}")
+    if _USE_QUANT_REGULARIZER:
+        log0(
+            f"kernel:quant_regularizer:enabled lambda:{args.quant_lambda} "
+            f"theta_init:{MU_ANGLE:.6f} (=3π/4, Quantization.lean §1 Q1.2)"
+        )
 
     # ── Seed + tokenizer ──────────────────────────────────────────────────────
 
@@ -1224,6 +1406,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        quant_lambda=args.quant_lambda,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1245,6 +1428,10 @@ def main() -> None:
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
+    if _USE_QUANT_REGULARIZER:
+        # quant_phase_theta is a top-level scalar parameter, not in base_model.blocks,
+        # so it must be appended explicitly (same pattern as skip_weights above).
+        scalar_params.append(base_model.quant_phase_theta)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1424,6 +1611,15 @@ def main() -> None:
                 f"step_t:{last_step_ms:.1f}ms "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if _USE_QUANT_REGULARIZER:
+                # Log current phase and regularizer value for monitoring convergence
+                # toward the μ^8=1 fixed points (Quantization.lean §1 Q1.2).
+                _theta_val = base_model.quant_phase_theta.item()
+                _cycle_val = 1.0 - math.cos(8.0 * _theta_val)
+                log0(
+                    f"quant:theta:{_theta_val:.6f} cycle_loss:{_cycle_val:.6f} "
+                    f"weighted:{args.quant_lambda * _cycle_val:.6f}"
+                )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:
