@@ -269,6 +269,7 @@ All other imports are from the Python standard library.
 | `AMPLITUDE_LAMBDA` | `0.01` | Weight of the amplitude balance regularizer |
 | `CROSS_LAMBDA` | `0.005` | Weight of joint Q3.2+Q4.1 cross-term `\|H·T−5π/4\|·\|2r²−1\|` — active when both regularizers ON |
 | `PHASE_VARIANCE_LAMBDA` | `0.0` | Weight of phase-variance term Var(θ_l) across layers — disabled by default |
+| `REGULARIZER_WARMUP_STEPS` | `300` | Steps to ramp regularizer weight 0→1; set 0 to disable ramp (constant λ throughout) |
 | `USE_LYAPUNOV_GAIN` | `0` | Scale QK dot-products by Lyapunov gain from §10 |
 | `USE_MU_PHASE` | `0` | Initialise each head's RoPE phase from μ-orbit slot |
 | `USE_PRECESSION` | `0` | Enable slow precession via PRECESSION_DELTA_PHI per step |
@@ -318,12 +319,15 @@ model_params:…                  # total parameter count
 warmup_step:N/20                # LR warmup progress
 step:N/ITERS train_loss:… step_t:…ms train_time:…ms step_avg:…ms
                                 # periodic train loss (every TRAIN_LOG_EVERY=200 steps)
+regul_scale:… (warmup_frac=… lr_scale=…)
+                                # regularizer schedule: ramp × LR scale (stability feature)
 quant:theta_mean:… theta_std:… cycle_loss_mean:… weighted:…
                                 # per-layer phase stats and 8-cycle regularizer (USE_QUANT_REGULARIZER=1)
 quant:h_times_t:… target:… drive_loss:… weighted:…
                                 # Hamiltonian drive monitoring (USE_DRIVE_REGULARIZER=1)
 quant:amplitude_r:… 2r^2:… amp_loss:… weighted:…
                                 # amplitude balance monitoring (USE_AMPLITUDE_REGULARIZER=1)
+quant:cross_loss:… weighted:…  # joint Q3.2+Q4.1 cross-term (both regularizers active)
 quant:kernel_eq_total:… (quant=… drive=… amp=… cross=… pvar=…)
                                 # combined KernelEquilibriumLoss all arms + cross-term
 step:N/ITERS val_loss:… val_bpb:… train_time:…ms
@@ -346,6 +350,7 @@ quantization_spec:Q1.2(mu^8=1) regularizer=ENABLED per-layer lambda=0.0100 theta
 quantization_spec:Q3.2(H*T=5pi/4) regularizer=ENABLED lambda=0.0100 h_times_t_init=3.926991
 quantization_spec:Q4.1(2eta^2=1) regularizer=ENABLED lambda=0.0100 amplitude_r_init=0.707107 (=1/sqrt(2))
 quantization_spec:cross_term(joint_Q3.2+Q4.1) ENABLED cross_lambda=0.0050 phase_variance_lambda=0.0000
+quantization_spec:regul_schedule regularizer_warmup_steps=300 warmdown_coupled=True (regul_scale=ramp(step)×lr_scale — stability feature, not early-training burden)
 quantization_spec:verified quant_phase_thetas present (num_layers=9 init_mean=2.356194 rad = MU_ANGLE=2.356194)
 quantization_spec:verified h_times_t present (init=3.926991 = 5π/4=3.926991)
 quantization_spec:verified amplitude_r present (init=0.707107 = 1/sqrt(2)=0.707107)

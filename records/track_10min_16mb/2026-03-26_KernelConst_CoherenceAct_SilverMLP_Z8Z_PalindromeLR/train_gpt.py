@@ -500,6 +500,29 @@ class Hyperparameters:
     # exploring the Z/8Z orbit.  Enable once the drive and amplitude arms have settled.
     phase_variance_lambda = float(os.environ.get("PHASE_VARIANCE_LAMBDA", 0.0))
 
+    # Regularizer warmup schedule — treat the KernelEquilibriumLoss regularizers as
+    # a stability feature rather than an early-training burden.
+    #
+    # During the first REGULARIZER_WARMUP_STEPS steps, all regularizer lambdas are
+    # linearly ramped from 0 → 1× their target values.  This keeps early training
+    # focused entirely on cross-entropy (maximum throughput), then smoothly engages
+    # the stability rails once the model has a solid initial representation.
+    #
+    # During LR warmdown, the regularizer scale also follows the palindrome-precession
+    # LR schedule (scale ∈ [0, 1]).  This lets the CE loss dominate the final
+    # compression pass — the kernel-equilibrium parameters (h_times_t, amplitude_r,
+    # quant_phase_thetas) have already converged to their targets by warmdown, so
+    # reducing the regularizer cost gives the optimizer room to minimise bits-per-byte.
+    #
+    # Combined effective scale at step s:
+    #   regul_scale = ramp(s) × lr_scale(s)
+    # where ramp(s) = min(s / regularizer_warmup_steps, 1).
+    #
+    # Default 300 steps — enough to clear the model's chaotic initialisation noise
+    # before the regularizers start pulling toward the equilibrium manifold.
+    # Set to 0 to disable ramping (constant λ throughout, original behaviour).
+    regularizer_warmup_steps = int(os.environ.get("REGULARIZER_WARMUP_STEPS", 300))
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MUON OPTIMIZER  (unchanged from baseline train_gpt.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1502,6 +1525,11 @@ class KernelGPT(nn.Module):
         self.amplitude_lambda: float = amplitude_lambda
         self.cross_lambda: float = cross_lambda
         self.phase_variance_lambda: float = phase_variance_lambda
+        # regul_scale ∈ [0, 1]: updated by the training loop each step via
+        # the warmup ramp × LR scale product (see main()).  Initialised to 1.0
+        # for direct use of the model outside the training loop (evaluation,
+        # post-training verification, tests).
+        self.regul_scale: float = 1.0
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1593,11 +1621,11 @@ class KernelGPT(nn.Module):
                 _quant_thetas,
                 _h_t,
                 _amp_r,
-                self.quant_lambda if _USE_QUANT_REGULARIZER else 0.0,
-                self.drive_lambda if _USE_DRIVE_REGULARIZER else 0.0,
-                self.amplitude_lambda if _USE_AMPLITUDE_REGULARIZER else 0.0,
-                cross_lambda=self.cross_lambda if (_USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER) else 0.0,
-                phase_variance_lambda=self.phase_variance_lambda if _USE_QUANT_REGULARIZER else 0.0,
+                (self.quant_lambda if _USE_QUANT_REGULARIZER else 0.0) * self.regul_scale,
+                (self.drive_lambda if _USE_DRIVE_REGULARIZER else 0.0) * self.regul_scale,
+                (self.amplitude_lambda if _USE_AMPLITUDE_REGULARIZER else 0.0) * self.regul_scale,
+                cross_lambda=(self.cross_lambda if (_USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER) else 0.0) * self.regul_scale,
+                phase_variance_lambda=(self.phase_variance_lambda if _USE_QUANT_REGULARIZER else 0.0) * self.regul_scale,
             )
         return loss
 
@@ -1723,6 +1751,12 @@ def main() -> None:
         f"{'ENABLED' if _cross_active else 'DISABLED (requires both USE_DRIVE and USE_AMPLITUDE)'} "
         f"cross_lambda={args.cross_lambda:.4f} "
         f"phase_variance_lambda={args.phase_variance_lambda:.4f}"
+    )
+    log0(
+        f"quantization_spec:regul_schedule "
+        f"regularizer_warmup_steps={args.regularizer_warmup_steps} "
+        f"warmdown_coupled=True "
+        f"(regul_scale=ramp(step)×lr_scale — stability feature, not early-training burden)"
     )
     if not _USE_QUANT_REGULARIZER:
         log0(
@@ -1992,6 +2026,18 @@ def main() -> None:
         step_t0 = time.perf_counter()
         elapsed_ms = training_time_ms + 1000.0 * (step_t0 - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # ── Regularizer scale: warmup ramp × LR scale ──────────────────────────
+        # Treat KernelEquilibriumLoss as a stability feature, not an early burden:
+        #  • During the first REGULARIZER_WARMUP_STEPS, ramp 0 → 1 (pure CE start)
+        #  • During main training, full weight (stability rails engaged)
+        #  • During warmdown, follow LR scale so CE dominates the compression pass
+        _regul_warmup_frac = (
+            min(step / args.regularizer_warmup_steps, 1.0)
+            if args.regularizer_warmup_steps > 0 else 1.0
+        )
+        base_model.regul_scale = _regul_warmup_frac * scale
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -2035,6 +2081,10 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"step_t:{last_step_ms:.1f}ms "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
+            )
+            log0(
+                f"regul_scale:{base_model.regul_scale:.4f} "
+                f"(warmup_frac={_regul_warmup_frac:.3f} lr_scale={scale:.3f})"
             )
             _cycle_mean = 0.0
             _quant_thetas_loaded = False
