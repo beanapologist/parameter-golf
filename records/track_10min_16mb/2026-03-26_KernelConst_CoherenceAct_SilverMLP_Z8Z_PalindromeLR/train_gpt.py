@@ -404,6 +404,15 @@ _USE_DRIVE_REGULARIZER: bool = os.environ.get("USE_DRIVE_REGULARIZER", "1") == "
 # Adds a learnable amplitude_r parameter and a penalty λ_amp·(2r²−1)².
 # Enabled by default to bias the model toward the balanced canonical state.
 _USE_AMPLITUDE_REGULARIZER: bool = os.environ.get("USE_AMPLITUDE_REGULARIZER", "1") == "1"
+# 8-cycle-closure–gated quantization enforcement (s/t mode gating).
+# When GATE_QUANT_TO_CLOSURE=1, the negative-real (t) enforcement
+# (quant_lambda term of KernelEquilibriumLoss, representing μ^8=1 via
+# Quantization.lean Q1.2) runs only at 8-cycle closure steps.
+# Closure is defined as step % MU_ORBIT_SIZE == 0 where step is 0-based
+# (the 0th iteration runs at step=0; closure fires at steps 0,8,16,...).
+# On non-closure steps only the cheap (s) path (phase-advance/CE) applies.
+# Default 0 = existing always-on behavior for backward compatibility.
+_GATE_QUANT_TO_CLOSURE: bool = os.environ.get("GATE_QUANT_TO_CLOSURE", "0") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
@@ -1359,6 +1368,19 @@ def _run_kernel_selftest() -> None:
         "KERNEL_SELFTEST: FLOQUET_PHASE must equal π (Quantization.lean Q3.1)"
     )
 
+    # ── 8-cycle closure gate — step-index convention ──────────────────────────
+    # Verify the is_8cycle_closure rule: step is 0-based; closure fires at
+    # step % MU_ORBIT_SIZE == 0 (steps 0, 8, 16, 24, …).
+    _closure_steps_range = [s for s in range(3 * MU_ORBIT_SIZE + 1) if s % MU_ORBIT_SIZE == 0]
+    assert _closure_steps_range == [0, 8, 16, 24], (
+        f"KERNEL_SELFTEST: 8-cycle closure steps must be [0,8,16,24] in range(25); "
+        f"got {_closure_steps_range}"
+    )
+    # Steps 1–7 (within the first orbit) must not be closure steps.
+    assert all(s % MU_ORBIT_SIZE != 0 for s in range(1, MU_ORBIT_SIZE)), (
+        "KERNEL_SELFTEST: steps 1-7 must not be 8-cycle closure steps"
+    )
+
     print("kernel_selftest: all checks PASSED ✓")
 
 
@@ -1542,6 +1564,11 @@ class KernelGPT(nn.Module):
         # limit under fullgraph=True.  The training loop updates it in-place
         # with .fill_() before each forward pass.
         self.register_buffer("regul_scale", torch.tensor(1.0, dtype=torch.float32))
+        # quant_closure_scale: 1.0 on 8-cycle closure steps, 0.0 otherwise when
+        # GATE_QUANT_TO_CLOSURE=1.  Always 1.0 when gating is disabled (default).
+        # Registered as a buffer (not a float) for the same TorchDynamo stability
+        # reason as regul_scale above.  Updated in-place by .fill_() each step.
+        self.register_buffer("quant_closure_scale", torch.tensor(1.0, dtype=torch.float32))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1633,7 +1660,7 @@ class KernelGPT(nn.Module):
                 _quant_thetas,
                 _h_t,
                 _amp_r,
-                (self.quant_lambda if _USE_QUANT_REGULARIZER else 0.0) * self.regul_scale,
+                (self.quant_lambda if _USE_QUANT_REGULARIZER else 0.0) * self.regul_scale * self.quant_closure_scale,
                 (self.drive_lambda if _USE_DRIVE_REGULARIZER else 0.0) * self.regul_scale,
                 (self.amplitude_lambda if _USE_AMPLITUDE_REGULARIZER else 0.0) * self.regul_scale,
                 cross_lambda=(self.cross_lambda if (_USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER) else 0.0) * self.regul_scale,
@@ -1769,6 +1796,14 @@ def main() -> None:
         f"regularizer_warmup_steps={args.regularizer_warmup_steps} "
         f"warmdown_coupled=True "
         f"(regul_scale=ramp(step)×lr_scale — stability feature, not early-training burden)"
+    )
+    # 8-cycle closure gate status: step convention and cadence.
+    # step is 0-based internally; (t) enforcement triggers at step%MU_ORBIT_SIZE==0.
+    log0(
+        f"quantization_spec:8cycle_closure_gate "
+        f"{'ENABLED (t-enforcement at closure steps only)' if _GATE_QUANT_TO_CLOSURE else 'DISABLED (always-on; set GATE_QUANT_TO_CLOSURE=1 to gate)'} "
+        f"cadence=every {MU_ORBIT_SIZE} steps "
+        f"step_convention=0-based (closure at step%{MU_ORBIT_SIZE}==0, i.e. step=0,{MU_ORBIT_SIZE},{2*MU_ORBIT_SIZE},...; logged as step:1,{MU_ORBIT_SIZE+1},{2*MU_ORBIT_SIZE+1},...)"
     )
     if not _USE_QUANT_REGULARIZER:
         log0(
@@ -2116,6 +2151,16 @@ def main() -> None:
             if args.regularizer_warmup_steps > 0 else 1.0
         )
         base_model.regul_scale.fill_(_regul_warmup_frac * scale)
+
+        # ── 8-cycle closure gate (s/t mode) ─────────────────────────────────
+        # step is 0-based: the first training iteration executes at step=0.
+        # Closure fires at step=0,8,16,… (every MU_ORBIT_SIZE iterations).
+        # (t) = negative-real/lean-verified arm (quant_lambda); gated here.
+        # (s) = positive-imaginary/phase-advance path; runs every step (cheap).
+        is_8cycle_closure = (step % MU_ORBIT_SIZE == 0)
+        base_model.quant_closure_scale.fill_(
+            1.0 if (not _GATE_QUANT_TO_CLOSURE or is_8cycle_closure) else 0.0
+        )
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
