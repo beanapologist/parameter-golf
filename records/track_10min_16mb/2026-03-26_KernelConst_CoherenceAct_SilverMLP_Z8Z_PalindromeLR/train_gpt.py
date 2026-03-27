@@ -1160,11 +1160,11 @@ def kernel_equilibrium_loss(
     quant_phase_thetas: Tensor,
     h_times_t: Tensor,
     amplitude_r: Tensor,
-    quant_lambda: float,
-    drive_lambda: float,
-    amplitude_lambda: float,
-    cross_lambda: float = 0.0,
-    phase_variance_lambda: float = 0.0,
+    quant_lambda: "float | Tensor",
+    drive_lambda: "float | Tensor",
+    amplitude_lambda: "float | Tensor",
+    cross_lambda: "float | Tensor" = 0.0,
+    phase_variance_lambda: "float | Tensor" = 0.0,
 ) -> Tensor:
     """Unified KernelEquilibriumLoss: assembles all Theorem Q regularizers.
 
@@ -1187,6 +1187,19 @@ def kernel_equilibrium_loss(
     imply lead_quantization_confirmed, but gradient descent only pushes toward
     those fixed points without guaranteeing exact satisfaction.
 
+    DDP NOTE: The lambda arguments may arrive as Tensors (the product of a
+    Python float and the ``regul_scale`` / ``quant_closure_scale`` buffers).
+    Conditional guards of the form ``if lambda > 0.0`` evaluated against a
+    tensor cause the associated learnable parameters (quant_phase_thetas,
+    h_times_t, amplitude_r) to be absent from the autograd graph whenever the
+    buffer is zero (e.g. during regularizer warmup where regul_scale ramps
+    from 0 → 1).  DDP requires *every* parameter to receive a gradient on
+    every backward pass, so a missing gradient triggers:
+        RuntimeError: Expected to have finished reduction in the prior iteration
+    Fix: always add every term unconditionally.  When a lambda tensor is 0.0
+    the contribution to loss is 0, but the parameter still participates in the
+    computation graph and receives a zero gradient, satisfying DDP.
+
     Args:
         quant_phase_thetas:    per-layer phase tensor of shape (num_layers,).
         h_times_t:             scalar tensor for learnable Hamiltonian product H·T.
@@ -1200,24 +1213,32 @@ def kernel_equilibrium_loss(
     Returns:
         Scalar non-negative regularization loss.
     """
+    # Always add every term so that quant_phase_thetas, h_times_t, and
+    # amplitude_r are unconditionally part of the autograd computation graph.
+    # When a lambda is 0.0 (plain float or zero-valued Tensor), the term
+    # contributes zero to the loss but preserves gradient flow to the
+    # associated parameter, preventing the DDP unused-parameter crash.
     loss = quant_phase_thetas.new_zeros(())
-    if quant_lambda > 0.0:
-        loss = loss + quant_lambda * eight_cycle_loss(quant_phase_thetas).mean()
+    loss = loss + quant_lambda * eight_cycle_loss(quant_phase_thetas).mean()
     # Compute raw deviations once, reused by drive, amplitude, and cross terms.
     drive_raw = h_times_t - HAMILTONIAN_DRIVE_TARGET           # H·T − 5π/4
     amp_raw = 2.0 * amplitude_r.square() - 1.0                 # 2r² − 1
-    if drive_lambda > 0.0:
-        loss = loss + drive_lambda * drive_raw.square()
-    if amplitude_lambda > 0.0:
-        loss = loss + amplitude_lambda * amp_raw.square()
-    if cross_lambda > 0.0:
-        # Cross-term: |H·T − 5π/4| · |2r² − 1|  (zero when either arm is satisfied).
-        # Encourages simultaneous satisfaction of Q3.2 and Q4.1, mirroring the
-        # "simultaneous validity" structure of lead_quantization_confirmed (§5).
-        loss = loss + cross_lambda * drive_raw.abs() * amp_raw.abs()
-    if phase_variance_lambda > 0.0 and quant_phase_thetas.numel() > 1:
+    loss = loss + drive_lambda * drive_raw.square()
+    loss = loss + amplitude_lambda * amp_raw.square()
+    # Cross-term: |H·T − 5π/4| · |2r² − 1|  (zero when either arm is satisfied).
+    # Encourages simultaneous satisfaction of Q3.2 and Q4.1, mirroring the
+    # "simultaneous validity" structure of lead_quantization_confirmed (§5).
+    loss = loss + cross_lambda * drive_raw.abs() * amp_raw.abs()
+    if quant_phase_thetas.numel() > 1:
         # Phase-variance: Var(θ_l) across layers.  Zero when all layers share
         # the same orbit point; positive when they diverge.
+        # NOTE: The `phase_variance_lambda > 0.0` guard was intentionally kept
+        # removed (consistent with the other lambda guards), but the
+        # `numel() > 1` guard is *functional* not performance-only: calling
+        # `.var()` on a single-element tensor raises an error (unbiased
+        # variance requires at least 2 elements).  When lambda is 0.0 the term
+        # still contributes zero loss while keeping quant_phase_thetas in the
+        # computation graph — the numel guard is the only guard needed here.
         loss = loss + phase_variance_lambda * quant_phase_thetas.var()
     return loss
 
@@ -1915,7 +1936,32 @@ def main() -> None:
     # fullgraph=False: allows Dynamo to fall back gracefully instead of
     # hard-crashing on any residual guard misses (e.g. from per-step scalars).
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
+    # find_unused_parameters=False (default): all parameters must receive a gradient
+    # on every backward pass.  kernel_equilibrium_loss() was fixed to always include
+    # every regularizer term unconditionally so that quant_phase_thetas, h_times_t,
+    # and amplitude_r are always in the computation graph (with zero gradient when
+    # regul_scale=0.0 during warmup) — preventing the DDP reduction crash:
+    #   RuntimeError: Expected to have finished reduction in the prior iteration
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+
+    # Debug aid: when TORCH_DISTRIBUTED_DEBUG=INFO or DETAIL, register a hook
+    # that logs any parameter that did not receive a gradient after backward.
+    # This makes future unused-parameter regressions easy to diagnose without
+    # needing to reproduce the full DDP crash.
+    _ddp_debug = os.environ.get("TORCH_DISTRIBUTED_DEBUG", "OFF").upper()
+    if distributed and _ddp_debug in ("INFO", "DETAIL"):
+        def _make_grad_check_hook(param_name: str):
+            def _hook(grad: Tensor) -> Tensor:
+                if grad is None or grad.abs().max() == 0:
+                    log0(
+                        f"ddp_debug:zero_or_missing_grad param={param_name} "
+                        f"rank={rank}"
+                    )
+                return grad
+            return _hook
+        for _pname, _p in base_model.named_parameters():
+            if _p.requires_grad:
+                _p.register_hook(_make_grad_check_hook(_pname))
 
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
