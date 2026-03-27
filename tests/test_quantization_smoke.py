@@ -42,7 +42,6 @@ from train_gpt_kernel import (
     FLOQUET_PHASE,
     SILVER_RATIO,
     MU_ORBIT_SIZE,
-    ETA_SQUARED,
     eight_cycle_loss,
     coherence,
     KernelGPT,
