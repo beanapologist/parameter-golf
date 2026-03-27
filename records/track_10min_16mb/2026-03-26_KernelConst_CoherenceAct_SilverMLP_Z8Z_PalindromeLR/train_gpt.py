@@ -430,6 +430,13 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
+    # Optional: define warmdown window directly in seconds when wallclock-capped.
+    # When MAX_WALLCLOCK_SECONDS > 0 and WARMDOWN_SECONDS > 0, LR stays at 1.0
+    # until (max_wallclock_seconds - warmdown_seconds) seconds have elapsed, then
+    # follows the palindrome precession schedule down to 0 by the cap.
+    # This decouples warmdown from noisy step-time estimation.
+    # Default 0.0 = disabled (use WARMDOWN_ITERS-based logic instead).
+    warmdown_seconds = float(os.environ.get("WARMDOWN_SECONDS", 0.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
     # Model shape.
@@ -1944,30 +1951,95 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    warmdown_seconds_ms = args.warmdown_seconds * 1000.0 if args.warmdown_seconds > 0 else 0.0
+
+    # EMA of per-step wall time (ms) — updated in the main loop each step.
+    # Stored as a one-element list so that lr_mul (a closure) can read the
+    # latest value without requiring 'nonlocal'.
+    _step_ms_ema: list[float] = [0.0]
+    _EMA_ALPHA = 0.1  # smoothing factor: keeps ~7 effective recent steps in memory
+                      # (τ ≈ 1/α = 10 steps), giving stable estimates after ~20 steps
+                      # while still tracking gradual GPU-frequency variation.
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         """LR multiplier using palindrome precession schedule (CriticalEigenvalue.lean §9, §16).
 
-        Replaces the previous linear warmdown with the coherence function
-        C(r) = 2r/(1+r²) evaluated at r = remaining/warmdown ∈ [0,1].
-        This is strictly smoother than a linear ramp: C has zero derivative at
-        r=0, so the LR tapers gracefully rather than hitting a hard zero.
+        Three modes, selected in priority order:
+          1. Step-based (max_wallclock_ms is None): canonical warmdown from
+             (iterations - warmdown_iters) to iterations.
+          2. WARMDOWN_SECONDS (wallclock + warmdown_seconds_ms > 0): LR stays at
+             1.0 until elapsed_ms >= max_wallclock_ms - warmdown_seconds_ms, then
+             follows palindrome precession to 0.  Decoupled from step-time noise.
+          3. Fallback wallclock (no WARMDOWN_SECONDS): estimates warmdown window
+             from the EMA step time, capped to 50% of total budget so that large
+             WARMDOWN_ITERS values do not trigger premature warmdown.
         """
         if args.warmdown_iters <= 0:
             return 1.0
         if max_wallclock_ms is None:
+            # ── Mode 1: step-based ────────────────────────────────────────────
             warmdown_start = max(args.iterations - args.warmdown_iters, 0)
             if step < warmdown_start:
                 return 1.0
             r = (args.iterations - step) / max(args.warmdown_iters, 1)
-        else:
-            step_ms = elapsed_ms / max(step, 1)
-            warmdown_ms = args.warmdown_iters * step_ms
+        elif warmdown_seconds_ms > 0:
+            # ── Mode 2: WARMDOWN_SECONDS ──────────────────────────────────────
+            # Keep LR at 1.0 until the final warmdown_seconds of the budget, then
+            # apply palindrome precession.  r = remaining / warmdown_window ∈ [0,1].
             remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            if remaining_ms > warmdown_seconds_ms:
+                return 1.0
+            r = remaining_ms / warmdown_seconds_ms
+        else:
+            # ── Mode 3: fallback wallclock with EMA step time ─────────────────
+            # Use EMA of step time (less noisy than elapsed_ms/step early on).
+            # Fall back to the per-step average when EMA is not yet populated.
+            est_step_ms = (
+                _step_ms_ema[0] if _step_ms_ema[0] > 0
+                else elapsed_ms / max(step, 1)
+            )
+            warmdown_ms = args.warmdown_iters * est_step_ms
+            remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
+            # Guard: cap the warmdown window to at most 50% of the total wallclock
+            # budget.  Without this, large WARMDOWN_ITERS (e.g. 3000 steps in a
+            # 600 s run) yields warmdown_ms > max_wallclock_ms, which makes
+            # remaining_ms < warmdown_ms from step 0 and collapses LR immediately.
+            # 50% is a conservative upper bound: warmdown should be a minority of
+            # the run, not dominate it.  Use WARMDOWN_SECONDS for precise control.
+            warmdown_ms = min(warmdown_ms, 0.5 * max_wallclock_ms)
             if remaining_ms > warmdown_ms:
                 return 1.0
             r = remaining_ms / max(warmdown_ms, 1e-9)
         return palindrome_precession_scale(r)
+
+    # ── Log warmdown mode (rank-0 only) ──────────────────────────────────────
+    if max_wallclock_ms is None:
+        _wd_start_step = max(args.iterations - args.warmdown_iters, 0)
+        log0(
+            f"warmdown_mode:step_based "
+            f"warmdown_start_step:{_wd_start_step} "
+            f"warmdown_iters:{args.warmdown_iters}"
+        )
+    elif warmdown_seconds_ms > 0:
+        _wd_start_ms = max_wallclock_ms - warmdown_seconds_ms
+        if warmdown_seconds_ms >= max_wallclock_ms:
+            log0(
+                f"warmdown_mode:wallclock_seconds WARNING: "
+                f"warmdown_seconds ({args.warmdown_seconds:.1f}s) >= "
+                f"max_wallclock_seconds ({args.max_wallclock_seconds:.1f}s) — "
+                f"LR will be in warmdown from step 0; consider reducing WARMDOWN_SECONDS"
+            )
+        log0(
+            f"warmdown_mode:wallclock_seconds "
+            f"warmdown_seconds:{args.warmdown_seconds:.1f} "
+            f"warmdown_start_ms:{max(_wd_start_ms, 0.0):.0f}"
+        )
+    else:
+        log0(
+            f"warmdown_mode:wallclock_estimated "
+            f"warmdown_iters:{args.warmdown_iters} "
+            f"(step_time estimated via EMA; window capped to 50% of wallclock budget)"
+        )
 
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
@@ -2078,6 +2150,11 @@ def main() -> None:
 
         step += 1
         last_step_ms = 1000.0 * (time.perf_counter() - step_t0)
+        # Update step-time EMA used by lr_mul (Mode 3 fallback).
+        if _step_ms_ema[0] == 0.0:
+            _step_ms_ema[0] = last_step_ms
+        else:
+            _step_ms_ema[0] = _EMA_ALPHA * last_step_ms + (1.0 - _EMA_ALPHA) * _step_ms_ema[0]
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
