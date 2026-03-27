@@ -487,13 +487,17 @@ class Hyperparameters:
     #   L_cross = λ_x · |H·T − 5π/4| · |2r²−1|
     # This is zero when either condition is satisfied and mirrors the "simultaneous
     # validity" structure of lead_quantization_confirmed (Quantization.lean §5).
-    # Default 0.001 (10× gentler than the individual arms).
-    cross_lambda = float(os.environ.get("CROSS_LAMBDA", 0.001))
+    # Default 0.005 — strong enough to produce a noticeable joint signal without
+    # dominating the CE loss (individual arm lambdas are ~0.01).
+    cross_lambda = float(os.environ.get("CROSS_LAMBDA", 0.005))
 
     # Phase-variance weight λ_v — penalises spread of per-layer θ_l phases:
     #   L_var = λ_v · Var(θ_l)
     # Encourages all layers to converge toward the same μ-orbit fixed point,
-    # maintaining global Z/8Z coherence.  Default 0.0 (opt-in via PHASE_VARIANCE_LAMBDA).
+    # maintaining global Z/8Z coherence.
+    # Default 0.0 (opt-in via PHASE_VARIANCE_LAMBDA) — disabled by default to avoid
+    # over-constraining per-layer phases during early training when they are still
+    # exploring the Z/8Z orbit.  Enable once the drive and amplitude arms have settled.
     phase_variance_lambda = float(os.environ.get("PHASE_VARIANCE_LAMBDA", 0.0))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1484,7 +1488,7 @@ class KernelGPT(nn.Module):
         quant_lambda: float = 0.01,
         drive_lambda: float = 0.01,
         amplitude_lambda: float = 0.01,
-        cross_lambda: float = 0.001,
+        cross_lambda: float = 0.005,
         phase_variance_lambda: float = 0.0,
     ):
         super().__init__()
@@ -2083,6 +2087,13 @@ def main() -> None:
                     args.phase_variance_lambda * _thetas.var().item()
                     if _quant_thetas_loaded and _thetas.numel() > 1 else 0.0
                 )
+                # Log cross-term individually (same cadence as drive_loss / amp_loss above).
+                if _USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER:
+                    _cross_raw = abs(_ht_dev) * abs(_amp_dev)
+                    log0(
+                        f"quant:cross_loss:{_cross_raw:.6f} "
+                        f"weighted:{_x_weighted:.6f}"
+                    )
                 log0(
                     f"quant:kernel_eq_total:"
                     f"{_q_weighted + _d_weighted + _a_weighted + _x_weighted + _pv_weighted:.6f} "

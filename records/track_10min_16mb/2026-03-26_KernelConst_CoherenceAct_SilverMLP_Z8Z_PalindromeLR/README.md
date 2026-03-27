@@ -117,7 +117,7 @@ Complementary to the coherence activation which already peaks at r = 1.
 This term is **zero whenever either Q3.2 or Q4.1 is satisfied** and is positive only when
 both conditions are simultaneously violated.  This mirrors the "simultaneous validity"
 structure proved in `lead_quantization_confirmed` (Quantization.lean §5) — the theorem holds
-only when all conditions hold together.  Enabled by default with `CROSS_LAMBDA=0.001`
+only when all conditions hold together.  Enabled by default with `CROSS_LAMBDA=0.005`
 (10× gentler than individual arms to avoid dominating the CE loss).
 
 #### Arm 5 — Phase-Variance Coherence (optional, USE_QUANT_REGULARIZER=1)
@@ -267,7 +267,7 @@ All other imports are from the Python standard library.
 | `DRIVE_LAMBDA` | `0.01` | Weight of the Hamiltonian drive regularizer |
 | `USE_AMPLITUDE_REGULARIZER` | **`1`** | Amplitude balance loss λ·(2r²−1)² (Quantization.lean §4 Q4.1) — **ON by default** |
 | `AMPLITUDE_LAMBDA` | `0.01` | Weight of the amplitude balance regularizer |
-| `CROSS_LAMBDA` | `0.001` | Weight of joint Q3.2+Q4.1 cross-term `\|H·T−5π/4\|·\|2r²−1\|` — active when both regularizers ON |
+| `CROSS_LAMBDA` | `0.005` | Weight of joint Q3.2+Q4.1 cross-term `\|H·T−5π/4\|·\|2r²−1\|` — active when both regularizers ON |
 | `PHASE_VARIANCE_LAMBDA` | `0.0` | Weight of phase-variance term Var(θ_l) across layers — disabled by default |
 | `USE_LYAPUNOV_GAIN` | `0` | Scale QK dot-products by Lyapunov gain from §10 |
 | `USE_MU_PHASE` | `0` | Initialise each head's RoPE phase from μ-orbit slot |
@@ -304,7 +304,7 @@ quantization_spec:source …      # Quantization.lean spec loaded
 quantization_spec:Q1.2(mu^8=1) regularizer=ENABLED per-layer …
 quantization_spec:Q3.2(H*T=5pi/4) regularizer=ENABLED …
 quantization_spec:Q4.1(2eta^2=1) regularizer=ENABLED …
-quantization_spec:cross_term(joint_Q3.2+Q4.1) ENABLED cross_lambda=0.0010 …
+quantization_spec:cross_term(joint_Q3.2+Q4.1) ENABLED cross_lambda=0.0050 …
                                 # all 6 Q conditions logged; DISABLED warns
 quantization_spec:verified quant_phase_thetas present …
                                 # confirms per-layer quant_phase_thetas wired (when USE_QUANT_REGULARIZER=1)
@@ -345,7 +345,7 @@ quantization_spec:source formal-lean/Quantization.lean (lead_quantization_confir
 quantization_spec:Q1.2(mu^8=1) regularizer=ENABLED per-layer lambda=0.0100 theta_init=2.356194 num_layers=9
 quantization_spec:Q3.2(H*T=5pi/4) regularizer=ENABLED lambda=0.0100 h_times_t_init=3.926991
 quantization_spec:Q4.1(2eta^2=1) regularizer=ENABLED lambda=0.0100 amplitude_r_init=0.707107 (=1/sqrt(2))
-quantization_spec:cross_term(joint_Q3.2+Q4.1) ENABLED cross_lambda=0.0010 phase_variance_lambda=0.0000
+quantization_spec:cross_term(joint_Q3.2+Q4.1) ENABLED cross_lambda=0.0050 phase_variance_lambda=0.0000
 quantization_spec:verified quant_phase_thetas present (num_layers=9 init_mean=2.356194 rad = MU_ANGLE=2.356194)
 quantization_spec:verified h_times_t present (init=3.926991 = 5π/4=3.926991)
 quantization_spec:verified amplitude_r present (init=0.707107 = 1/sqrt(2)=0.707107)
