@@ -360,8 +360,11 @@ _USE_MU_PHASE: bool = os.environ.get("USE_MU_PHASE", "0") == "1"
 _USE_PRECESSION: bool = os.environ.get("USE_PRECESSION", "0") == "1"
 # Quantization regularizer: enforce μ^8=1 via 8-cycle closure loss
 # (Quantization.lean §1 Q1.2, §5 lead_quantization_confirmed).
-# Weight controlled by QUANT_LAMBDA; near-zero when disabled (default off).
-_USE_QUANT_REGULARIZER: bool = os.environ.get("USE_QUANT_REGULARIZER", "0") == "1"
+# Weight controlled by QUANT_LAMBDA.  Enabled by default so that the
+# Quantization.lean spec is actually applied during training rather than
+# only being verified at import time.  Set USE_QUANT_REGULARIZER=0 to
+# disable (e.g. to reproduce the original unregularized run).
+_USE_QUANT_REGULARIZER: bool = os.environ.get("USE_QUANT_REGULARIZER", "1") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
@@ -1362,10 +1365,37 @@ def main() -> None:
     )
     if _USE_LYAPUNOV_GAIN or _USE_MU_PHASE:
         log0(f"kernel:features lyapunov_gain:{int(_USE_LYAPUNOV_GAIN)} mu_phase:{int(_USE_MU_PHASE)} precession:{int(_USE_PRECESSION)}")
-    if _USE_QUANT_REGULARIZER:
+    # ── Quantization.lean spec status ─────────────────────────────────────────
+    # Log all five conditions from lead_quantization_confirmed (Quantization.lean §5)
+    # regardless of whether the regularizer is on, so the training log always
+    # records which conditions are actively enforced vs. only verified at import.
+    log0(f"quantization_spec:source formal-lean/Quantization.lean (lead_quantization_confirmed)")
+    log0(
+        f"quantization_spec:Q1.2(mu^8=1) "
+        f"regularizer={'ENABLED' if _USE_QUANT_REGULARIZER else 'DISABLED (set USE_QUANT_REGULARIZER=1)'} "
+        f"lambda={args.quant_lambda if _USE_QUANT_REGULARIZER else 0.0:.4f} "
+        f"theta_init={MU_ANGLE:.6f}"
+    )
+    log0(
+        f"quantization_spec:Q3.1(floquet_phase=pi) constants_verified=True training_applied=False "
+        f"FLOQUET_PHASE={FLOQUET_PHASE:.6f}"
+    )
+    log0(
+        f"quantization_spec:Q4.1(2eta^2=1) constants_verified=True training_applied=False "
+        f"ETA_SQUARED={ETA_SQUARED:.6f}"
+    )
+    log0(
+        f"quantization_spec:Q4.3(C(1)=1) constants_verified=True "
+        f"training_applied=True (coherence activation in every MLP block)"
+    )
+    log0(
+        f"quantization_spec:Q2.2(E1=-1) constants_verified=True training_applied=False"
+    )
+    if not _USE_QUANT_REGULARIZER:
         log0(
-            f"kernel:quant_regularizer:enabled lambda:{args.quant_lambda} "
-            f"theta_init:{MU_ANGLE:.6f} (=3π/4, Quantization.lean §1 Q1.2)"
+            "quantization_spec:WARNING USE_QUANT_REGULARIZER=0 — "
+            "the Quantization.lean 8-cycle closure condition (Q1.2 mu^8=1) is NOT enforced "
+            "during training.  Re-run with USE_QUANT_REGULARIZER=1 to activate."
         )
 
     # ── Seed + tokenizer ──────────────────────────────────────────────────────
@@ -1412,6 +1442,24 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+
+    # ── Verify Quantization.lean wiring is active ─────────────────────────────
+    # Confirm that quant_phase_theta was created when USE_QUANT_REGULARIZER=1.
+    # An absent parameter means the flag and the model are out of sync, which
+    # is exactly the silent-ignore failure mode we are guarding against.
+    if _USE_QUANT_REGULARIZER:
+        quant_param_names = [n for n, _ in base_model.named_parameters() if "quant_phase_theta" in n]
+        if not quant_param_names:
+            raise RuntimeError(
+                "USE_QUANT_REGULARIZER=1 but 'quant_phase_theta' parameter was not found "
+                "in the model.  The Quantization.lean 8-cycle closure condition (Q1.2) "
+                "is silently not applied.  Check KernelGPT.__init__ for the flag guard."
+            )
+        log0(
+            f"quantization_spec:verified quant_phase_theta present "
+            f"(init={base_model.quant_phase_theta.item():.6f} rad = MU_ANGLE={MU_ANGLE:.6f})"
+        )
+
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
