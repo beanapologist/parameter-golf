@@ -2,9 +2,9 @@
 Smoke test for the Quantization.lean integration in train_gpt_kernel.py.
 
 Verifies that the KernelEquilibriumLoss (8-cycle closure, Hamiltonian drive,
-and amplitude balance regularizers) derived from formal-lean/Quantization.lean
-(lead_quantization_confirmed) is wired into KernelGPT and produces a measurable
-training signal.
+amplitude balance regularizers, cross-term, and phase-variance term) derived
+from formal-lean/Quantization.lean (lead_quantization_confirmed) is wired into
+KernelGPT and produces a measurable training signal.
 
 Run with:
     python tests/test_quantization_smoke.py
@@ -60,12 +60,18 @@ from train_gpt_kernel import (
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 _EPS = 1e-5
+# Tolerance for cross-term "zero" checks where the product |drive_raw| * |amp_raw| is
+# analytically 0 but may differ slightly between two forward passes on the same model
+# due to floating-point reordering of unrelated operations.
+_CROSS_ZERO_TOL = 1e-3
 
 
 def _make_tiny_model(
     quant_lambda: float = 0.01,
     drive_lambda: float = 0.01,
     amplitude_lambda: float = 0.01,
+    cross_lambda: float = 0.0,
+    phase_variance_lambda: float = 0.0,
 ) -> KernelGPT:
     """Return the smallest valid KernelGPT instance (CPU, float32)."""
     return KernelGPT(
@@ -83,6 +89,8 @@ def _make_tiny_model(
         quant_lambda=quant_lambda,
         drive_lambda=drive_lambda,
         amplitude_lambda=amplitude_lambda,
+        cross_lambda=cross_lambda,
+        phase_variance_lambda=phase_variance_lambda,
     )
 
 
@@ -384,13 +392,13 @@ def test_amplitude_balance_loss_properties() -> None:
 # ── Test 14: kernel_equilibrium_loss combines all three arms ──────────────────
 
 def test_kernel_equilibrium_loss_combines_arms() -> None:
-    """kernel_equilibrium_loss must combine 8-cycle, drive, and amplitude terms."""
+    """kernel_equilibrium_loss must combine 8-cycle, drive, amplitude, and cross terms."""
     thetas = torch.full((2,), MU_ANGLE)  # at fixed point
     ht = torch.tensor(HAMILTONIAN_DRIVE_TARGET)  # at target
     r = torch.tensor(math.sqrt(0.5))  # at balance
 
-    # All at fixed points: total loss = 0 regardless of lambdas
-    loss_zero = kernel_equilibrium_loss(thetas, ht, r, 1.0, 1.0, 1.0).item()
+    # All at fixed points: total loss = 0 regardless of lambdas (including cross-term)
+    loss_zero = kernel_equilibrium_loss(thetas, ht, r, 1.0, 1.0, 1.0, cross_lambda=1.0).item()
     assert abs(loss_zero) < _EPS, (
         f"kernel_equilibrium_loss at all fixed points = {loss_zero:.4e}, expected 0."
     )
@@ -422,10 +430,44 @@ def test_kernel_equilibrium_loss_combines_arms() -> None:
         f"kernel_equilibrium_loss with all lambdas=0 = {loss_all_zero:.4e}, expected 0."
     )
 
+    # Cross-term: zero when either drive or amplitude is at fixed point
+    loss_cross_drive_ok = kernel_equilibrium_loss(thetas, ht, r_off, 0.0, 0.0, 0.0, cross_lambda=1.0).item()
+    assert abs(loss_cross_drive_ok) < _EPS, (
+        f"cross-term must be 0 when H·T is at target: got {loss_cross_drive_ok:.4e}"
+    )
+    loss_cross_amp_ok = kernel_equilibrium_loss(thetas, ht_off, r, 0.0, 0.0, 0.0, cross_lambda=1.0).item()
+    assert abs(loss_cross_amp_ok) < _EPS, (
+        f"cross-term must be 0 when amplitude is balanced: got {loss_cross_amp_ok:.4e}"
+    )
+
+    # Cross-term: positive when both Q3.2 and Q4.1 are violated
+    loss_cross_both_off = kernel_equilibrium_loss(thetas, ht_off, r_off, 0.0, 0.0, 0.0, cross_lambda=1.0).item()
+    assert loss_cross_both_off > 0.0, (
+        f"cross-term must be > 0 when both H·T and amplitude deviate: got {loss_cross_both_off:.4f}"
+    )
+
+    # Phase-variance term: zero when all thetas are equal (same orbit point)
+    thetas_uniform = torch.full((4,), MU_ANGLE + 0.5)  # all equal — var = 0
+    loss_pvar_uniform = kernel_equilibrium_loss(
+        thetas_uniform, ht, r, 0.0, 0.0, 0.0, phase_variance_lambda=1.0
+    ).item()
+    assert abs(loss_pvar_uniform) < _EPS, (
+        f"phase-variance term must be 0 when all thetas are equal: got {loss_pvar_uniform:.4e}"
+    )
+    # Phase-variance term: positive when thetas differ
+    thetas_mixed = torch.tensor([0.0, math.pi / 4, math.pi / 2, 3 * math.pi / 4])
+    loss_pvar_mixed = kernel_equilibrium_loss(
+        thetas_mixed, ht, r, 0.0, 0.0, 0.0, phase_variance_lambda=1.0
+    ).item()
+    assert loss_pvar_mixed > 0.0, (
+        f"phase-variance term must be > 0 when thetas differ: got {loss_pvar_mixed:.4f}"
+    )
+
     print(
         f"PASS  test_kernel_equilibrium_loss_combines_arms  "
         f"(at_fixed={loss_zero:.2e} quant={loss_quant_only:.4f} "
-        f"drive={loss_drive_only:.4f} amp={loss_amp_only:.4f})"
+        f"drive={loss_drive_only:.4f} amp={loss_amp_only:.4f} "
+        f"cross_both_off={loss_cross_both_off:.4f})"
     )
 
 
@@ -460,6 +502,87 @@ def test_drive_and_amplitude_contribute_to_loss() -> None:
     )
 
 
+# ── Test 16: cross-term contributes to forward-pass loss ──────────────────────
+
+def test_cross_term_contributes_to_loss() -> None:
+    """cross_lambda must add loss only when BOTH h_times_t and amplitude_r deviate."""
+    x = torch.zeros(1, 4, dtype=torch.long)
+    y = torch.ones(1, 4, dtype=torch.long)
+
+    # Build a single model with cross_lambda=1.0 but all individual lambdas=0.
+    model = _make_tiny_model(quant_lambda=0.0, drive_lambda=0.0, amplitude_lambda=0.0, cross_lambda=1.0)
+
+    # Baseline: h_times_t at target AND amplitude balanced → cross-term = 0
+    with torch.no_grad():
+        model.h_times_t.fill_(HAMILTONIAN_DRIVE_TARGET)
+        model.amplitude_r.fill_(math.sqrt(0.5))
+        loss_both_ok = model(x, y).item()
+
+    # h_times_t at target, amplitude deviated → cross-term = 0 (drive_raw = 0)
+    with torch.no_grad():
+        model.amplitude_r.fill_(1.0)
+        loss_drive_ok = model(x, y).item()
+    assert abs(loss_drive_ok - loss_both_ok) < _CROSS_ZERO_TOL, (
+        f"cross-term must be 0 when H·T is at target: delta={loss_drive_ok - loss_both_ok:.4e}"
+    )
+
+    # h_times_t deviated, amplitude balanced → cross-term = 0 (amp_raw = 0)
+    with torch.no_grad():
+        model.h_times_t.fill_(HAMILTONIAN_DRIVE_TARGET + 1.0)
+        model.amplitude_r.fill_(math.sqrt(0.5))
+        loss_amp_ok = model(x, y).item()
+    assert abs(loss_amp_ok - loss_both_ok) < _CROSS_ZERO_TOL, (
+        f"cross-term must be 0 when amplitude is balanced: delta={loss_amp_ok - loss_both_ok:.4e}"
+    )
+
+    # Both deviated → cross-term = |1.0| * |2*1^2 - 1| = |1.0| * 1.0 = 1.0 > 0
+    with torch.no_grad():
+        model.h_times_t.fill_(HAMILTONIAN_DRIVE_TARGET + 1.0)
+        model.amplitude_r.fill_(1.0)
+        loss_both_off = model(x, y).item()
+    assert loss_both_off > loss_both_ok + _EPS, (
+        f"cross-term must be > 0 when both H·T and amplitude deviate: "
+        f"both_off={loss_both_off:.4f} not > both_ok={loss_both_ok:.4f}"
+    )
+    print(
+        f"PASS  test_cross_term_contributes_to_loss  "
+        f"(both_ok={loss_both_ok:.4f} drive_ok={loss_drive_ok:.4f} "
+        f"amp_ok={loss_amp_ok:.4f} both_off={loss_both_off:.4f})"
+    )
+
+
+# ── Test 17: phase-variance term penalises diverging layer phases ──────────────
+
+def test_phase_variance_penalises_divergence() -> None:
+    """phase_variance_lambda must add loss when layer thetas differ."""
+    # All thetas at fixed point (uniform): var = 0 → no extra loss
+    model_uniform = _make_tiny_model(quant_lambda=0.0, drive_lambda=0.0, amplitude_lambda=0.0, phase_variance_lambda=1.0)
+    with torch.no_grad():
+        model_uniform.quant_phase_thetas.fill_(MU_ANGLE)
+    x = torch.zeros(1, 4, dtype=torch.long)
+    y = torch.ones(1, 4, dtype=torch.long)
+    with torch.no_grad():
+        loss_uniform = model_uniform(x, y).item()
+
+    # Diverged thetas: var > 0 → extra loss
+    model_diverged = _make_tiny_model(quant_lambda=0.0, drive_lambda=0.0, amplitude_lambda=0.0, phase_variance_lambda=1.0)
+    with torch.no_grad():
+        model_diverged.quant_phase_thetas.copy_(
+            torch.tensor([MU_ANGLE, MU_ANGLE + math.pi / 4], dtype=torch.float32)
+        )
+    with torch.no_grad():
+        loss_diverged = model_diverged(x, y).item()
+
+    assert loss_diverged > loss_uniform + _EPS, (
+        f"phase-variance term must increase loss when thetas differ: "
+        f"diverged={loss_diverged:.6f} not > uniform={loss_uniform:.6f}"
+    )
+    print(
+        f"PASS  test_phase_variance_penalises_divergence  "
+        f"(uniform={loss_uniform:.6f} diverged={loss_diverged:.6f})"
+    )
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 _TESTS = [
@@ -478,6 +601,8 @@ _TESTS = [
     test_amplitude_balance_loss_properties,
     test_kernel_equilibrium_loss_combines_arms,
     test_drive_and_amplitude_contribute_to_loss,
+    test_cross_term_contributes_to_loss,
+    test_phase_variance_penalises_divergence,
 ]
 
 

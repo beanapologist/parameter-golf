@@ -4,11 +4,13 @@
 
 > **Note (Kernel-Inspired Approximation):** This implementation approximates the
 > "lead-confirmed equilibrium" via `KernelEquilibriumLoss` regularizers rather than strictly
-> enforcing the drive condition H·T = 5π/4.  The full simultaneous lead confirmation (Theorem Q,
-> `lead_quantization_confirmed` in Quantization.lean §5) is softly approximated: the loss terms
-> push learned parameters toward the five conditions (Q1–Q5) but do not guarantee exact
-> satisfaction during training.  Use `_verify_lead_confirmation` (run automatically post-training)
-> to inspect how closely the learned parameters satisfy all five conditions.
+> enforcing the Quantization.lean conditions simultaneously.  Three additive arms (Q1.2, Q3.2, Q4.1)
+> plus an optional cross-term λ_x·|H·T−5π/4|·|2r²−1| (which penalizes simultaneous deviation from
+> Q3.2 and Q4.1, mirroring the "simultaneous validity" of `lead_quantization_confirmed`) and a
+> phase-variance term λ_v·Var(θ_l) (which keeps all layer phases coherent with the same μ-orbit
+> point) push learned parameters toward the six Q conditions via gradient descent but do not
+> guarantee exact satisfaction.  `_verify_lead_confirmation` runs automatically post-training and
+> prints a Q1–Q6 table with per-condition deviations and an overall equilibrium deviation.
 
 ## Summary of Changes vs Baseline
 
@@ -25,6 +27,8 @@ model architecture and learning-rate schedule:
 | 8-cycle regularizer (Q1.2) | — | Per-layer `quant_phase_thetas` + loss λ·mean(1−cos(8θ_l)) (ON by default) |
 | Hamiltonian drive (Q3.2) | — | Learnable `h_times_t`, loss λ·(H·T − 5π/4)² (ON by default) |
 | Amplitude balance (Q4.1) | — | Learnable `amplitude_r`, loss λ·(2r²−1)² (ON by default) |
+| Joint cross-term (Q3.2+Q4.1) | — | λ_x·\|H·T−5π/4\|·\|2r²−1\| — zero when either arm is satisfied (ON by default) |
+| Phase-variance coherence | — | λ_v·Var(θ_l) across layers — keeps all layers at same μ-orbit (OFF by default) |
 | Feature flags (disabled by default) | — | USE_LYAPUNOV_GAIN, USE_MU_PHASE, USE_PRECESSION |
 
 ### 1. Coherence Activation  C(r) = 2r / (1 + r²)
@@ -58,11 +62,10 @@ The warmdown uses the same coherence function C(r) evaluated at
 C(r) = C(1/r) (palindrome symmetry) so the warmdown mirrors a warmup under r ↦ 1/r,
 making the full LR arc palindromic in the sense of the Lean theorems (§9, §11, §16).
 
-### 5. KernelEquilibriumLoss  (three-arm soft regularizer for Theorem Q)
+### 5. KernelEquilibriumLoss  (five-term soft regularizer for Theorem Q)
 
 Integrates `formal-lean/Quantization.lean`'s machine-checked capstone theorem
-`lead_quantization_confirmed` into the BPB training loss via three independently-controllable
-soft penalty arms:
+`lead_quantization_confirmed` into the BPB training loss via five terms:
 
 #### Arm 1 — 8-Cycle Closure (Q1.2, USE_QUANT_REGULARIZER=1)
 
@@ -107,36 +110,61 @@ Complementary to the coherence activation which already peaks at r = 1.
 
 - Training log: `quant:amplitude_r:… 2r^2:… amp_loss:… weighted:…`
 
+#### Arm 4 — Joint Cross-Term (Q3.2 + Q4.1 simultaneous)
+
+    loss_cross = CROSS_LAMBDA · |H·T − 5π/4| · |2r² − 1|
+
+This term is **zero whenever either Q3.2 or Q4.1 is satisfied** and is positive only when
+both conditions are simultaneously violated.  This mirrors the "simultaneous validity"
+structure proved in `lead_quantization_confirmed` (Quantization.lean §5) — the theorem holds
+only when all conditions hold together.  Enabled by default with `CROSS_LAMBDA=0.001`
+(10× gentler than individual arms to avoid dominating the CE loss).
+
+#### Arm 5 — Phase-Variance Coherence (optional, USE_QUANT_REGULARIZER=1)
+
+    loss_pvar = PHASE_VARIANCE_LAMBDA · Var(θ_l)
+
+Penalises the spread of per-layer `quant_phase_thetas` values.  Zero when all layers share the
+same orbit point; positive when they diverge.  Encourages global Z/8Z coherence beyond
+individual-layer fixed-point satisfaction.  Disabled by default (`PHASE_VARIANCE_LAMBDA=0`).
+
 #### Unified KernelEquilibriumLoss
 
-All three arms are combined into a single `kernel_equilibrium_loss()` function:
+All five terms combine:
 
-    L_eq = L_quant + L_drive + L_amp
+    L_eq = L_quant + L_drive + L_amp + L_cross + L_pvar
 
-The five conditions of `lead_quantization_confirmed` mapped to Python:
+A combined `quant:kernel_eq_total` log line is emitted every `TRAIN_LOG_EVERY` steps
+showing each component and the total.
 
-| Lean theorem | Condition | Python |
-|---|---|---|
-| Q1.2 `quant_phase_eight_cycle` | μ^8 = 1 | `cos(8·θ_l) == 1` ↔ `L_quant(θ_l) == 0` (per-layer) |
-| Q3.2 `quant_floquet_recipe` | H·T = 5π/4 | `h_times_t == HAMILTONIAN_DRIVE_TARGET` ↔ `L_drive == 0` |
-| Q3.1 `quant_floquet_phase` | ε_F·T = π | `FLOQUET_PHASE = math.pi` (constant) |
-| Q4.1 `quant_amplitude_balance` | 2η² = 1 | `2·amplitude_r² == 1` ↔ `L_amp == 0` |
-| Q4.3 `quant_amplitude_coherence_max` | C(1) = 1 | coherence activation in every MLP block |
-| Q2.2 `quant_energy_ground` | E₁ = −1 | verified in `_selfcheck_quantization_spec()` |
+The six conditions of `lead_quantization_confirmed` mapped to Python:
 
-All three arms are **enabled by default**.  Set the corresponding env vars to `0` for ablation.
+| Q# | Lean theorem | Condition | Python |
+|---|---|---|---|
+| Q1 | Q3.1 `quant_floquet_phase` | ε_F·T = π | `FLOQUET_PHASE = math.pi` (constant) |
+| Q2 | Q3.2 `quant_floquet_recipe` | H·T = 5π/4 | `h_times_t == HAMILTONIAN_DRIVE_TARGET` |
+| Q3 | Q1.2 `quant_phase_eight_cycle` | μ^8 = 1 | `cos(8·θ_l) == 1` (per-layer) |
+| Q4 | Q4.1 `quant_amplitude_balance` | 2η² = 1 | `2·amplitude_r² == 1` |
+| Q5 | Q4.3 `quant_amplitude_coherence_max` | C(1) = 1 | coherence activation in every MLP block |
+| Q6 | Q2.2 `quant_energy_ground` | E₁ = −1 | exact by construction |
 
 #### Post-Training Verification
 
-`_verify_lead_confirmation(model)` runs automatically after training and prints a report:
+`_verify_lead_confirmation(model)` runs automatically after training and prints a structured table:
 
 ```
-lead_confirmation_verification: Theorem Q numeric check
-  Q1.2 (μ^8=1):       max_layer_err=0.000000  mean_err=0.000000  PASS
-  Q3.2 (H·T=5π/4):    learned H·T=3.926991  target=3.926991  err=0.000000  PASS
-  Q4.1 (2η²=1):       learned r=0.707107  2r²=1.000000  err=0.000000  PASS
-  Q4.3 (C(1)=1):      C(1)=1.000000  err=0.00e+00  PASS (exact by construction)
-  Q2.2 (E₁=−1):       E₁=-1.000000  err=0.00e+00  PASS (exact by construction)
+──────────────────────────────────────────────────────────────────────
+lead_confirmation_check: Theorem Q  (Quantization.lean §5 lead_quantization_confirmed)
+──────────────────────────────────────────────────────────────────────
+  Q1     ε_F·T = π                  Lean:Q3.1   dev:  0.00e+00  EXACT
+  Q2     H·T = 5π/4  (=3.9270)      Lean:Q3.2   dev:  8.93e-05  approx
+  Q3     μ^8=1 (9 layers, mean)     Lean:Q1.2   dev:  3.40e-06  approx
+  Q4     2η²=1  (r=0.7071)          Lean:Q4.1   dev:  1.23e-04  approx
+  Q5     C(1) = 1                   Lean:Q4.3   dev:  0.00e+00  EXACT (by construction)
+  Q6     E₁ = −1                    Lean:Q2.2   dev:  0.00e+00  EXACT (by construction)
+──────────────────────────────────────────────────────────────────────
+  Overall equilibrium deviation (max of learnable Q2–Q4): 1.23e-04
+──────────────────────────────────────────────────────────────────────
 ```
 
 ### Tokenizer / Dataset
@@ -239,6 +267,8 @@ All other imports are from the Python standard library.
 | `DRIVE_LAMBDA` | `0.01` | Weight of the Hamiltonian drive regularizer |
 | `USE_AMPLITUDE_REGULARIZER` | **`1`** | Amplitude balance loss λ·(2r²−1)² (Quantization.lean §4 Q4.1) — **ON by default** |
 | `AMPLITUDE_LAMBDA` | `0.01` | Weight of the amplitude balance regularizer |
+| `CROSS_LAMBDA` | `0.001` | Weight of joint Q3.2+Q4.1 cross-term `\|H·T−5π/4\|·\|2r²−1\|` — active when both regularizers ON |
+| `PHASE_VARIANCE_LAMBDA` | `0.0` | Weight of phase-variance term Var(θ_l) across layers — disabled by default |
 | `USE_LYAPUNOV_GAIN` | `0` | Scale QK dot-products by Lyapunov gain from §10 |
 | `USE_MU_PHASE` | `0` | Initialise each head's RoPE phase from μ-orbit slot |
 | `USE_PRECESSION` | `0` | Enable slow precession via PRECESSION_DELTA_PHI per step |
@@ -274,7 +304,8 @@ quantization_spec:source …      # Quantization.lean spec loaded
 quantization_spec:Q1.2(mu^8=1) regularizer=ENABLED per-layer …
 quantization_spec:Q3.2(H*T=5pi/4) regularizer=ENABLED …
 quantization_spec:Q4.1(2eta^2=1) regularizer=ENABLED …
-                                # all 5 Quantization.lean conditions logged; DISABLED warns
+quantization_spec:cross_term(joint_Q3.2+Q4.1) ENABLED cross_lambda=0.0010 …
+                                # all 6 Q conditions logged; DISABLED warns
 quantization_spec:verified quant_phase_thetas present …
                                 # confirms per-layer quant_phase_thetas wired (when USE_QUANT_REGULARIZER=1)
 quantization_spec:verified h_times_t present …
@@ -293,11 +324,12 @@ quant:h_times_t:… target:… drive_loss:… weighted:…
                                 # Hamiltonian drive monitoring (USE_DRIVE_REGULARIZER=1)
 quant:amplitude_r:… 2r^2:… amp_loss:… weighted:…
                                 # amplitude balance monitoring (USE_AMPLITUDE_REGULARIZER=1)
+quant:kernel_eq_total:… (quant=… drive=… amp=… cross=… pvar=…)
+                                # combined KernelEquilibriumLoss all arms + cross-term
 step:N/ITERS val_loss:… val_bpb:… train_time:…ms
                                 # validation checkpoint (every VAL_LOSS_EVERY=1000 steps)
 stopping_early: wallclock_cap   # emitted when MAX_WALLCLOCK_SECONDS is reached
-lead_confirmation_verification: …
-                                # post-training Theorem Q numeric check (all 5 conditions)
+lead_confirmation_check: …      # post-training Theorem Q Q1–Q6 table + overall deviation
 final_int8_zlib_roundtrip val_loss:… val_bpb:…
                                 # round-trip accuracy after int8 quantization + zlib
 peak memory allocated: … MiB    # GPU memory high-water mark
@@ -306,14 +338,14 @@ peak memory allocated: … MiB    # GPU memory high-water mark
 ### How to Verify Quantization.lean is Active
 
 After starting a run, look for these lines in the log file to confirm the
-spec is loaded and all three KernelEquilibriumLoss arms are wired:
+spec is loaded and all KernelEquilibriumLoss arms are wired:
 
 ```
 quantization_spec:source formal-lean/Quantization.lean (lead_quantization_confirmed)
 quantization_spec:Q1.2(mu^8=1) regularizer=ENABLED per-layer lambda=0.0100 theta_init=2.356194 num_layers=9
 quantization_spec:Q3.2(H*T=5pi/4) regularizer=ENABLED lambda=0.0100 h_times_t_init=3.926991
 quantization_spec:Q4.1(2eta^2=1) regularizer=ENABLED lambda=0.0100 amplitude_r_init=0.707107 (=1/sqrt(2))
-quantization_spec:Q4.3(C(1)=1) constants_verified=True training_applied=True (coherence activation in every MLP block)
+quantization_spec:cross_term(joint_Q3.2+Q4.1) ENABLED cross_lambda=0.0010 phase_variance_lambda=0.0000
 quantization_spec:verified quant_phase_thetas present (num_layers=9 init_mean=2.356194 rad = MU_ANGLE=2.356194)
 quantization_spec:verified h_times_t present (init=3.926991 = 5π/4=3.926991)
 quantization_spec:verified amplitude_r present (init=0.707107 = 1/sqrt(2)=0.707107)
@@ -322,7 +354,7 @@ quantization_spec:verified amplitude_r present (init=0.707107 = 1/sqrt(2)=0.7071
 If instead you see `regularizer=DISABLED …` lines, that arm of `KernelEquilibriumLoss` is off.
 
 To run the smoke tests that verify the full KernelEquilibriumLoss pipeline end-to-end
-(15 tests, no GPU required):
+(17 tests, no GPU required):
 
 ```bash
 # From repository root — no GPU required
