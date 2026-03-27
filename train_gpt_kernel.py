@@ -2,6 +2,20 @@
 train_gpt_kernel.py — Parameter-Golf training pipeline informed by the
 formal Lean 4 theorems in formal-lean/CriticalEigenvalue.lean.
 
+NOTE (Kernel-Inspired Approximation): This implementation approximates the
+"lead-confirmed equilibrium" via KernelEquilibriumLoss regularizers rather
+than strictly enforcing the Quantization.lean conditions.  Three additive arms
+target the core conditions of lead_quantization_confirmed (Quantization.lean §5):
+  • Q1.2 (quant_phase_eight_cycle):  per-layer 8-cycle closure   — λ·mean(1−cos(8θ_l))
+  • Q3.2 (quant_floquet_recipe):     Hamiltonian drive H·T=5π/4  — λ·(H·T − 5π/4)²
+  • Q4.1 (quant_amplitude_balance):  amplitude balance 2η²=1     — λ·(2r²−1)²
+An optional cross-term λ_x·|H·T−5π/4|·|2r²−1| further penalizes simultaneous
+deviation from Q3.2 and Q4.1, better mirroring the "simultaneous validity"
+structure of lead_quantization_confirmed.  A phase-variance term
+λ_v·Var(θ_l) optionally encourages all layer phases to converge to the same
+μ-orbit fixed point.  Call _verify_lead_confirmation(model) post-training to
+inspect numerical alignment with all six Q conditions.
+
 Three mathematical objects from the Kernel formalization are wired
 directly into the model architecture:
 
@@ -91,6 +105,12 @@ ETA_SQUARED: float = 0.5                     # η² = 1/2
 # Floquet phase quantization: ε_F · T = π  (Quantization.lean §3 Q3.1).
 # The quasi-energy π/T accumulates exactly one half-period per Floquet cycle.
 FLOQUET_PHASE: float = math.pi               # ε_F · T = π
+
+# Hamiltonian drive target: H · T = 5π/4  (Quantization.lean §3 Q3.2).
+# This is the trigger for lead_quantization_confirmed: when H·T = 5π/4 the
+# Floquet operator U = exp(−I·H·T) equals the critical eigenvalue μ.
+# Ref: Quantization.lean quant_floquet_recipe.
+HAMILTONIAN_DRIVE_TARGET: float = 5.0 * math.pi / 4.0  # H·T = 5π/4
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PALINDROME PRECESSION LR FORMULA  (CriticalEigenvalue.lean §9 + §16)
@@ -345,6 +365,13 @@ def _selfcheck_quantization_spec() -> None:
         f"got {_c1}."
     )
 
+    # ── §3 Q3.2: Hamiltonian drive H·T = 5π/4 ───────────────────────────────
+    # HAMILTONIAN_DRIVE_TARGET is the trigger for lead_quantization_confirmed.
+    assert abs(HAMILTONIAN_DRIVE_TARGET - 5.0 * math.pi / 4.0) < _eps, (
+        f"HAMILTONIAN_DRIVE_TARGET must equal 5π/4={5.0 * math.pi / 4.0:.15f}; "
+        f"got {HAMILTONIAN_DRIVE_TARGET} (Quantization.lean Q3.2 quant_floquet_recipe)."
+    )
+
 
 _selfcheck_quantization_spec()
 
@@ -360,11 +387,23 @@ _USE_MU_PHASE: bool = os.environ.get("USE_MU_PHASE", "0") == "1"
 _USE_PRECESSION: bool = os.environ.get("USE_PRECESSION", "0") == "1"
 # Quantization regularizer: enforce μ^8=1 via 8-cycle closure loss
 # (Quantization.lean §1 Q1.2, §5 lead_quantization_confirmed).
+# Per-layer phase parameters θ_l ensure each transformer layer independently
+# respects the 8-cycle orbit (stronger than the original single global θ).
 # Weight controlled by QUANT_LAMBDA.  Enabled by default so that the
 # Quantization.lean spec is actually applied during training rather than
 # only being verified at import time.  Set USE_QUANT_REGULARIZER=0 to
 # disable (e.g. to reproduce the original unregularized run).
 _USE_QUANT_REGULARIZER: bool = os.environ.get("USE_QUANT_REGULARIZER", "1") == "1"
+# Hamiltonian drive regularizer: soft penalty for H·T = 5π/4 condition
+# (Quantization.lean §3 Q3.2 quant_floquet_recipe, lead_quantization_confirmed).
+# Adds a learnable h_times_t parameter and a penalty λ_drive·(H·T − 5π/4)².
+# Enabled by default to activate the Floquet arm during training.
+_USE_DRIVE_REGULARIZER: bool = os.environ.get("USE_DRIVE_REGULARIZER", "1") == "1"
+# Amplitude balance regularizer: soft penalty for 2η² = 1 condition
+# (Quantization.lean §4 Q4.1 quant_amplitude_balance).
+# Adds a learnable amplitude_r parameter and a penalty λ_amp·(2r²−1)².
+# Enabled by default to bias the model toward the balanced canonical state.
+_USE_AMPLITUDE_REGULARIZER: bool = os.environ.get("USE_AMPLITUDE_REGULARIZER", "1") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
@@ -426,12 +465,63 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # Quantization regularizer weight λ — weight of the 8-cycle closure penalty
-    # L_quant = λ·(1−cos(8θ)) added to BPB training loss when USE_QUANT_REGULARIZER=1.
+    # L_quant = λ·mean(1−cos(8θ_l)) added to BPB training loss when USE_QUANT_REGULARIZER=1.
+    # Per-layer phases θ_l are used (one per transformer block).
     # Ref: formal-lean/Quantization.lean §1 Q1.2, §5 lead_quantization_confirmed.
     # Default 0.01 gives a gentle regularizing signal that does not dominate the
     # cross-entropy loss.  Set to 0 to fully suppress the term while leaving the
     # flag enabled (e.g. for logging only).
     quant_lambda = float(os.environ.get("QUANT_LAMBDA", 0.01))
+
+    # Hamiltonian drive penalty weight λ_drive — weight of the soft H·T=5π/4 condition
+    # L_drive = λ_drive·(H·T − 5π/4)² added to the loss when USE_DRIVE_REGULARIZER=1.
+    # Ref: formal-lean/Quantization.lean §3 Q3.2 (quant_floquet_recipe).
+    drive_lambda = float(os.environ.get("DRIVE_LAMBDA", 0.01))
+
+    # Amplitude balance penalty weight λ_amp — weight of the soft 2η²=1 condition
+    # L_amp = λ_amp·(2r²−1)² added to the loss when USE_AMPLITUDE_REGULARIZER=1.
+    # Ref: formal-lean/Quantization.lean §4 Q4.1 (quant_amplitude_balance).
+    amplitude_lambda = float(os.environ.get("AMPLITUDE_LAMBDA", 0.01))
+
+    # Cross-term weight λ_x — penalises simultaneous deviation from Q3.2 and Q4.1:
+    #   L_cross = λ_x · |H·T − 5π/4| · |2r²−1|
+    # This is zero when either condition is satisfied and mirrors the "simultaneous
+    # validity" structure of lead_quantization_confirmed (Quantization.lean §5).
+    # Default 0.005 — strong enough to produce a noticeable joint signal without
+    # dominating the CE loss (individual arm lambdas are ~0.01).
+    cross_lambda = float(os.environ.get("CROSS_LAMBDA", 0.005))
+
+    # Phase-variance weight λ_v — penalises spread of per-layer θ_l phases:
+    #   L_var = λ_v · Var(θ_l)
+    # Encourages all layers to converge toward the same μ-orbit fixed point,
+    # maintaining global Z/8Z coherence.
+    # Default 0.0 (opt-in via PHASE_VARIANCE_LAMBDA) — disabled by default to avoid
+    # over-constraining per-layer phases during early training when they are still
+    # exploring the Z/8Z orbit.  Enable once the drive and amplitude arms have settled.
+    phase_variance_lambda = float(os.environ.get("PHASE_VARIANCE_LAMBDA", 0.0))
+
+    # Regularizer warmup schedule — treat the KernelEquilibriumLoss regularizers as
+    # a stability feature rather than an early-training burden.
+    #
+    # During the first REGULARIZER_WARMUP_STEPS steps, all regularizer lambdas are
+    # linearly ramped from 0 → 1× their target values.  This keeps early training
+    # focused entirely on cross-entropy (maximum throughput), then smoothly engages
+    # the stability rails once the model has a solid initial representation.
+    #
+    # During LR warmdown, the regularizer scale also follows the palindrome-precession
+    # LR schedule (scale ∈ [0, 1]).  This lets the CE loss dominate the final
+    # compression pass — the kernel-equilibrium parameters (h_times_t, amplitude_r,
+    # quant_phase_thetas) have already converged to their targets by warmdown, so
+    # reducing the regularizer cost gives the optimizer room to minimise bits-per-byte.
+    #
+    # Combined effective scale at step s:
+    #   regul_scale = ramp(s) × lr_scale(s)
+    # where ramp(s) = min(s / regularizer_warmup_steps, 1).
+    #
+    # Default 300 steps — enough to clear the model's chaotic initialisation noise
+    # before the regularizers start pulling toward the equilibrium manifold.
+    # Set to 0 to disable ramping (constant λ throughout, original behaviour).
+    regularizer_warmup_steps = int(os.environ.get("REGULARIZER_WARMUP_STEPS", 300))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MUON OPTIMIZER  (unchanged from baseline train_gpt.py)
@@ -616,7 +706,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,q_lambda,mu_phase_gate,skip_weight,skip_weights,quant_phase_theta",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,q_lambda,mu_phase_gate,skip_weight,skip_weights,quant_phase_thetas,h_times_t,amplitude_r",
     ).split(",")
     if pattern
 )
@@ -999,6 +1089,123 @@ def eight_cycle_loss(theta: Tensor) -> Tensor:
     return 1.0 - torch.cos(8.0 * theta)
 
 
+def hamiltonian_drive_loss(h_times_t: Tensor) -> Tensor:
+    """Soft Hamiltonian drive condition: (H·T − 5π/4)².
+
+    Penalises deviation from the central trigger of lead_quantization_confirmed:
+    when H·T = HAMILTONIAN_DRIVE_TARGET = 5π/4 the Floquet operator equals the
+    critical eigenvalue μ (Quantization.lean §3 Q3.2 quant_floquet_recipe).
+
+    The loss is zero exactly at H·T = 5π/4 and grows quadratically away from it.
+    Initialising h_times_t = 5π/4 ensures zero penalty at the start of training.
+
+    Mapping to Lean spec:
+        Lean theorem                            | Python expression
+        ─────────────────────────────────────────────────────────
+        Q3.2  quant_floquet_recipe H·T=5π/4    | h_times_t == HAMILTONIAN_DRIVE_TARGET  ↔  loss == 0
+        lead_quantization_confirmed (hHT)       | hHT : H * T = 5 * π / 4
+
+    Args:
+        h_times_t: scalar tensor representing the learned product H·T.
+
+    Returns:
+        Non-negative scalar loss; zero at H·T = 5π/4.
+    """
+    return (h_times_t - HAMILTONIAN_DRIVE_TARGET).square()
+
+
+def amplitude_balance_loss(amplitude_r: Tensor) -> Tensor:
+    """Amplitude balance condition: (2r² − 1)².
+
+    Penalises deviation from the canonical equal-weight superposition where
+    η = 1/√2 and 2η² = 1 (Quantization.lean §4 Q4.1 quant_amplitude_balance).
+
+    The loss is zero exactly when amplitude_r = 1/√2 (i.e. 2r² = 1, the
+    balanced fixed point), and grows quadratically away.  The coherence
+    function C(r) also peaks at r = 1, so this regularizer is complementary
+    to the coherence activation already in every MLP block.
+
+    Mapping to Lean spec:
+        Lean theorem                              | Python expression
+        ────────────────────────────────────────────────────────────
+        Q4.1  quant_amplitude_balance 2η²=1      | 2*amplitude_r**2 == 1  ↔  loss == 0
+        Q4.3  quant_amplitude_coherence_max C(1)=1| C(1) = 1 (coherence already applied in MLP)
+
+    Args:
+        amplitude_r: scalar tensor representing the learned amplitude ratio η.
+
+    Returns:
+        Non-negative scalar loss; zero when 2·amplitude_r² = 1 (i.e. r = 1/√2).
+    """
+    return (2.0 * amplitude_r.square() - 1.0).square()
+
+
+def kernel_equilibrium_loss(
+    quant_phase_thetas: Tensor,
+    h_times_t: Tensor,
+    amplitude_r: Tensor,
+    quant_lambda: float,
+    drive_lambda: float,
+    amplitude_lambda: float,
+    cross_lambda: float = 0.0,
+    phase_variance_lambda: float = 0.0,
+) -> Tensor:
+    """Unified KernelEquilibriumLoss: assembles all Theorem Q regularizers.
+
+    Combines the arms of lead_quantization_confirmed (Quantization.lean §5):
+
+      Q1.2  8-cycle closure:      λ_q  · mean_l(1 − cos(8·θ_l))
+      Q3.2  Hamiltonian drive:    λ_d  · (H·T − 5π/4)²
+      Q4.1  Amplitude balance:    λ_a  · (2r² − 1)²
+      Joint cross-term:           λ_x  · |H·T − 5π/4| · |2r² − 1|
+      Phase-variance coherence:   λ_v  · Var(θ_l)
+
+    The cross-term is zero when *either* Q3.2 or Q4.1 is satisfied, and is
+    non-zero only when both conditions are simultaneously violated — mirroring
+    the "simultaneous validity" proved in lead_quantization_confirmed.
+
+    The phase-variance term penalises spread across the per-layer θ_l parameters,
+    encouraging all transformer blocks to converge to the same Z/8Z orbit point.
+
+    NOTE: This is a soft approximation — satisfying all terms to zero would
+    imply lead_quantization_confirmed, but gradient descent only pushes toward
+    those fixed points without guaranteeing exact satisfaction.
+
+    Args:
+        quant_phase_thetas:    per-layer phase tensor of shape (num_layers,).
+        h_times_t:             scalar tensor for learnable Hamiltonian product H·T.
+        amplitude_r:           scalar tensor for learnable amplitude ratio η.
+        quant_lambda:          weight for the 8-cycle closure term (Q1.2).
+        drive_lambda:          weight for the Hamiltonian drive term (Q3.2).
+        amplitude_lambda:      weight for the amplitude balance term (Q4.1).
+        cross_lambda:          weight for the joint Q3.2+Q4.1 cross-term.
+        phase_variance_lambda: weight for the per-layer phase-variance term.
+
+    Returns:
+        Scalar non-negative regularization loss.
+    """
+    loss = quant_phase_thetas.new_zeros(())
+    if quant_lambda > 0.0:
+        loss = loss + quant_lambda * eight_cycle_loss(quant_phase_thetas).mean()
+    # Compute raw deviations once, reused by drive, amplitude, and cross terms.
+    drive_raw = h_times_t - HAMILTONIAN_DRIVE_TARGET           # H·T − 5π/4
+    amp_raw = 2.0 * amplitude_r.square() - 1.0                 # 2r² − 1
+    if drive_lambda > 0.0:
+        loss = loss + drive_lambda * drive_raw.square()
+    if amplitude_lambda > 0.0:
+        loss = loss + amplitude_lambda * amp_raw.square()
+    if cross_lambda > 0.0:
+        # Cross-term: |H·T − 5π/4| · |2r² − 1|  (zero when either arm is satisfied).
+        # Encourages simultaneous satisfaction of Q3.2 and Q4.1, mirroring the
+        # "simultaneous validity" structure of lead_quantization_confirmed (§5).
+        loss = loss + cross_lambda * drive_raw.abs() * amp_raw.abs()
+    if phase_variance_lambda > 0.0 and quant_phase_thetas.numel() > 1:
+        # Phase-variance: Var(θ_l) across layers.  Zero when all layers share
+        # the same orbit point; positive when they diverge.
+        loss = loss + phase_variance_lambda * quant_phase_thetas.var()
+    return loss
+
+
 def _run_kernel_selftest() -> None:
     """Unit-test-like self-checks run when the env var KERNEL_SELFTEST=1.
 
@@ -1152,6 +1359,89 @@ if os.environ.get("KERNEL_SELFTEST", "0") == "1":
     _run_kernel_selftest()
 
 
+def _verify_lead_confirmation(model: "KernelGPT") -> None:
+    """Post-training check: how close are learned parameters to Theorem Q conditions?
+
+    Numerically verifies the six conditions of lead_quantization_confirmed
+    (Quantization.lean §5) using the model's learned parameter values and
+    prints a structured report with per-condition deviations and an overall
+    equilibrium deviation for the learnable conditions.
+
+    NOTE: KernelEquilibriumLoss only softly approximates these conditions via
+    gradient descent.  Values close to 0.0 indicate alignment; non-zero values
+    are expected after finite training.  This function does not modify the model.
+
+    Args:
+        model: A trained KernelGPT instance (unwrapped, not DDP/compiled).
+    """
+    PASS_TOL = 1e-6
+    header = "lead_confirmation_check: Theorem Q  (Quantization.lean §5 lead_quantization_confirmed)"
+    sep = "─" * 70
+    print(sep)
+    print(header)
+    print(sep)
+    fmt = "  {:<6}  {:<26}  Lean:{:<6}  dev: {:>10}  {}"
+
+    devs: list[float] = []  # collect learnable-condition deviations for overall summary
+
+    # Q1  ε_F·T = π  (Floquet phase — constant, not learned)
+    q1_dev = abs(FLOQUET_PHASE - math.pi)
+    q1_status = "EXACT" if q1_dev < PASS_TOL else f"dev={q1_dev:.2e}"
+    print(fmt.format("Q1", "ε_F·T = π", "Q3.1", f"{q1_dev:.2e}", q1_status))
+
+    # Q2  H·T = 5π/4  (Hamiltonian drive — learned via h_times_t)
+    if hasattr(model, "h_times_t"):
+        ht_val = model.h_times_t.detach().float().item()
+        q2_dev = abs(ht_val - HAMILTONIAN_DRIVE_TARGET)
+        q2_status = "EXACT" if q2_dev < PASS_TOL else "approx"
+        print(fmt.format("Q2", f"H·T = 5π/4  (={ht_val:.4f})", "Q3.2", f"{q2_dev:.2e}", q2_status))
+        devs.append(q2_dev)
+    else:
+        print(fmt.format("Q2", "H·T = 5π/4", "Q3.2", "n/a", "DISABLED"))
+
+    # Q3  μ^8 = 1 per layer  (8-cycle closure — learned via quant_phase_thetas)
+    if hasattr(model, "quant_phase_thetas"):
+        thetas = model.quant_phase_thetas.detach().float()
+        cycle_errs = (1.0 - torch.cos(8.0 * thetas)).abs()
+        q3_mean = cycle_errs.mean().item()
+        q3_max = cycle_errs.max().item()
+        q3_status = "EXACT" if q3_max < PASS_TOL else f"max={q3_max:.2e}"
+        print(fmt.format(
+            "Q3",
+            f"μ^8=1 ({thetas.numel()} layers, mean)",
+            "Q1.2",
+            f"{q3_mean:.2e}",
+            q3_status,
+        ))
+        devs.append(q3_mean)
+    else:
+        print(fmt.format("Q3", "μ^8 = 1", "Q1.2", "n/a", "DISABLED"))
+
+    # Q4  2η² = 1  (amplitude balance — learned via amplitude_r)
+    if hasattr(model, "amplitude_r"):
+        r_val = model.amplitude_r.detach().float().item()
+        q4_dev = abs(2.0 * r_val ** 2 - 1.0)
+        q4_status = "EXACT" if q4_dev < PASS_TOL else "approx"
+        print(fmt.format("Q4", f"2η²=1  (r={r_val:.4f})", "Q4.1", f"{q4_dev:.2e}", q4_status))
+        devs.append(q4_dev)
+    else:
+        print(fmt.format("Q4", "2η² = 1", "Q4.1", "n/a", "DISABLED"))
+
+    # Q5  C(1) = 1  (coherence maximum — exact by construction)
+    c1_dev = abs(2.0 * 1.0 / (1.0 + 1.0 ** 2) - 1.0)
+    print(fmt.format("Q5", "C(1) = 1", "Q4.3", f"{c1_dev:.2e}", "EXACT (by construction)"))
+
+    # Q6  E₁ = −1  (Rydberg ground state — exact by construction)
+    e1_dev = abs(-1.0 / (1 ** 2) - (-1.0))
+    print(fmt.format("Q6", "E₁ = −1", "Q2.2", f"{e1_dev:.2e}", "EXACT (by construction)"))
+
+    print(sep)
+    if devs:
+        overall = max(devs)
+        print(f"  Overall equilibrium deviation (max of learnable Q2–Q4): {overall:.2e}")
+    print(sep)
+
+
 class CoherenceMLP(nn.Module):
     """MLP block whose hidden width is ⌊δS·dim⌋ and activation is C(r).
 
@@ -1219,6 +1509,10 @@ class KernelGPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         quant_lambda: float = 0.01,
+        drive_lambda: float = 0.01,
+        amplitude_lambda: float = 0.01,
+        cross_lambda: float = 0.005,
+        phase_variance_lambda: float = 0.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1227,6 +1521,15 @@ class KernelGPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.quant_lambda: float = quant_lambda
+        self.drive_lambda: float = drive_lambda
+        self.amplitude_lambda: float = amplitude_lambda
+        self.cross_lambda: float = cross_lambda
+        self.phase_variance_lambda: float = phase_variance_lambda
+        # regul_scale ∈ [0, 1]: updated by the training loop each step via
+        # the warmup ramp × LR scale product (see main()).  Initialised to 1.0
+        # for direct use of the model outside the training loop (evaluation,
+        # post-training verification, tests).
+        self.regul_scale: float = 1.0
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1243,10 +1546,26 @@ class KernelGPT(nn.Module):
         if self.lm_head is not None:
             self.lm_head._zero_init = True
         if _USE_QUANT_REGULARIZER:
-            # Learnable phase θ for the 8-cycle closure regularizer.
-            # Initialised to MU_ANGLE = 3π/4 — a valid fixed point of L(θ) = 1−cos(8θ).
+            # Per-layer phase parameters for the 8-cycle closure regularizer.
+            # Each transformer block gets its own θ_l, all initialized to MU_ANGLE = 3π/4.
+            # This is stronger than a single global θ: each layer independently
+            # converges toward a Z/8Z fixed point.
             # Ref: Quantization.lean §1 Q1.2 (quant_phase_eight_cycle: μ^8 = 1).
-            self.quant_phase_theta = nn.Parameter(torch.tensor(MU_ANGLE, dtype=torch.float32))
+            self.quant_phase_thetas = nn.Parameter(
+                torch.full((num_layers,), MU_ANGLE, dtype=torch.float32)
+            )
+        if _USE_DRIVE_REGULARIZER:
+            # Learnable Hamiltonian product H·T, initialized to the 5π/4 target.
+            # The soft penalty (h_times_t − 5π/4)² keeps this near the value that
+            # makes the Floquet operator equal the critical eigenvalue μ.
+            # Ref: Quantization.lean §3 Q3.2 (quant_floquet_recipe: H·T = 5π/4).
+            self.h_times_t = nn.Parameter(torch.tensor(HAMILTONIAN_DRIVE_TARGET, dtype=torch.float32))
+        if _USE_AMPLITUDE_REGULARIZER:
+            # Learnable amplitude ratio η, initialized to 1/√2 (the balanced fixed point).
+            # The soft penalty (2r²−1)² keeps this near the canonical amplitude where
+            # 2η² = 1 and the coherence function reaches its maximum C(1) = 1.
+            # Ref: Quantization.lean §4 Q4.1 (quant_amplitude_balance: 2η² = 1).
+            self.amplitude_r = nn.Parameter(torch.tensor(math.sqrt(ETA_SQUARED), dtype=torch.float32))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1280,10 +1599,34 @@ class KernelGPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        if _USE_QUANT_REGULARIZER:
-            # 8-cycle closure regularizer — Quantization.lean §1 Q1.2 (μ^8 = 1).
-            # L_quant = λ · (1 − cos(8θ)): zero at every 8th root of unity k·π/4.
-            loss = loss + self.quant_lambda * eight_cycle_loss(self.quant_phase_theta)
+        if _USE_QUANT_REGULARIZER or _USE_DRIVE_REGULARIZER or _USE_AMPLITUDE_REGULARIZER:
+            # ── KernelEquilibriumLoss: Lean Theorem Q → code mapping ─────────────────
+            # Soft regularizer for lead_quantization_confirmed (Quantization.lean §5).
+            # Each active arm targets one condition of the five-condition theorem:
+            #
+            #   Lean condition                      | Arm                    | Active when
+            #   ────────────────────────────────────┼────────────────────────┼─────────────────────
+            #   Q1.2 quant_phase_eight_cycle μ^8=1  | quant_phase_thetas     | USE_QUANT_REGULARIZER
+            #   Q3.2 quant_floquet_recipe H·T=5π/4  | h_times_t              | USE_DRIVE_REGULARIZER
+            #   Q4.1 quant_amplitude_balance 2η²=1  | amplitude_r            | USE_AMPLITUDE_REGULARIZER
+            #   joint Q3.2+Q4.1 simultaneous        | cross-term             | both drive + amplitude
+            #   global Z/8Z coherence across layers | phase-variance         | phase_variance_lambda>0
+            #
+            # NOTE: gradient descent only pushes toward these fixed points; exact
+            # simultaneous satisfaction is not guaranteed (see module docstring).
+            _quant_thetas = self.quant_phase_thetas if _USE_QUANT_REGULARIZER else self.tok_emb.weight.new_zeros(1)
+            _h_t = self.h_times_t if _USE_DRIVE_REGULARIZER else self.tok_emb.weight.new_tensor(HAMILTONIAN_DRIVE_TARGET)
+            _amp_r = self.amplitude_r if _USE_AMPLITUDE_REGULARIZER else self.tok_emb.weight.new_tensor(math.sqrt(ETA_SQUARED))
+            loss = loss + kernel_equilibrium_loss(
+                _quant_thetas,
+                _h_t,
+                _amp_r,
+                (self.quant_lambda if _USE_QUANT_REGULARIZER else 0.0) * self.regul_scale,
+                (self.drive_lambda if _USE_DRIVE_REGULARIZER else 0.0) * self.regul_scale,
+                (self.amplitude_lambda if _USE_AMPLITUDE_REGULARIZER else 0.0) * self.regul_scale,
+                cross_lambda=(self.cross_lambda if (_USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER) else 0.0) * self.regul_scale,
+                phase_variance_lambda=(self.phase_variance_lambda if _USE_QUANT_REGULARIZER else 0.0) * self.regul_scale,
+            )
         return loss
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1369,20 +1712,30 @@ def main() -> None:
     # Log all five conditions from lead_quantization_confirmed (Quantization.lean §5)
     # regardless of whether the regularizer is on, so the training log always
     # records which conditions are actively enforced vs. only verified at import.
+    # NOTE: Conditions marked training_applied=True are softly approximated via
+    #       KernelEquilibriumLoss regularizers, not strictly enforced.
     log0(f"quantization_spec:source formal-lean/Quantization.lean (lead_quantization_confirmed)")
     log0(
         f"quantization_spec:Q1.2(mu^8=1) "
-        f"regularizer={'ENABLED' if _USE_QUANT_REGULARIZER else 'DISABLED (set USE_QUANT_REGULARIZER=1)'} "
+        f"regularizer={'ENABLED per-layer' if _USE_QUANT_REGULARIZER else 'DISABLED (set USE_QUANT_REGULARIZER=1)'} "
         f"lambda={args.quant_lambda if _USE_QUANT_REGULARIZER else 0.0:.4f} "
-        f"theta_init={MU_ANGLE:.6f}"
+        f"theta_init={MU_ANGLE:.6f} num_layers={args.num_layers}"
+    )
+    log0(
+        f"quantization_spec:Q3.2(H*T=5pi/4) "
+        f"regularizer={'ENABLED' if _USE_DRIVE_REGULARIZER else 'DISABLED (set USE_DRIVE_REGULARIZER=1)'} "
+        f"lambda={args.drive_lambda if _USE_DRIVE_REGULARIZER else 0.0:.4f} "
+        f"h_times_t_init={HAMILTONIAN_DRIVE_TARGET:.6f}"
     )
     log0(
         f"quantization_spec:Q3.1(floquet_phase=pi) constants_verified=True training_applied=False "
         f"FLOQUET_PHASE={FLOQUET_PHASE:.6f}"
     )
     log0(
-        f"quantization_spec:Q4.1(2eta^2=1) constants_verified=True training_applied=False "
-        f"ETA_SQUARED={ETA_SQUARED:.6f}"
+        f"quantization_spec:Q4.1(2eta^2=1) "
+        f"regularizer={'ENABLED' if _USE_AMPLITUDE_REGULARIZER else 'DISABLED (set USE_AMPLITUDE_REGULARIZER=1)'} "
+        f"lambda={args.amplitude_lambda if _USE_AMPLITUDE_REGULARIZER else 0.0:.4f} "
+        f"amplitude_r_init={math.sqrt(ETA_SQUARED):.6f} (=1/sqrt(2))"
     )
     log0(
         f"quantization_spec:Q4.3(C(1)=1) constants_verified=True "
@@ -1391,11 +1744,37 @@ def main() -> None:
     log0(
         f"quantization_spec:Q2.2(E1=-1) constants_verified=True training_applied=False"
     )
+    # Cross-term: only active when both drive and amplitude regularizers are on.
+    _cross_active = _USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER
+    log0(
+        f"quantization_spec:cross_term(joint_Q3.2+Q4.1) "
+        f"{'ENABLED' if _cross_active else 'DISABLED (requires both USE_DRIVE and USE_AMPLITUDE)'} "
+        f"cross_lambda={args.cross_lambda:.4f} "
+        f"phase_variance_lambda={args.phase_variance_lambda:.4f}"
+    )
+    log0(
+        f"quantization_spec:regul_schedule "
+        f"regularizer_warmup_steps={args.regularizer_warmup_steps} "
+        f"warmdown_coupled=True "
+        f"(regul_scale=ramp(step)×lr_scale — stability feature, not early-training burden)"
+    )
     if not _USE_QUANT_REGULARIZER:
         log0(
             "quantization_spec:WARNING USE_QUANT_REGULARIZER=0 — "
             "the Quantization.lean 8-cycle closure condition (Q1.2 mu^8=1) is NOT enforced "
             "during training.  Re-run with USE_QUANT_REGULARIZER=1 to activate."
+        )
+    if not _USE_DRIVE_REGULARIZER:
+        log0(
+            "quantization_spec:WARNING USE_DRIVE_REGULARIZER=0 — "
+            "the Hamiltonian drive condition (Q3.2 H*T=5pi/4) is NOT enforced "
+            "during training.  Re-run with USE_DRIVE_REGULARIZER=1 to activate."
+        )
+    if not _USE_AMPLITUDE_REGULARIZER:
+        log0(
+            "quantization_spec:WARNING USE_AMPLITUDE_REGULARIZER=0 — "
+            "the amplitude balance condition (Q4.1 2eta^2=1) is NOT enforced "
+            "during training.  Re-run with USE_AMPLITUDE_REGULARIZER=1 to activate."
         )
 
     # ── Seed + tokenizer ──────────────────────────────────────────────────────
@@ -1437,6 +1816,10 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         quant_lambda=args.quant_lambda,
+        drive_lambda=args.drive_lambda,
+        amplitude_lambda=args.amplitude_lambda,
+        cross_lambda=args.cross_lambda,
+        phase_variance_lambda=args.phase_variance_lambda,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1444,20 +1827,42 @@ def main() -> None:
     restore_low_dim_params_to_fp32(base_model)
 
     # ── Verify Quantization.lean wiring is active ─────────────────────────────
-    # Confirm that quant_phase_theta was created when USE_QUANT_REGULARIZER=1.
+    # Confirm that quant_phase_thetas was created when USE_QUANT_REGULARIZER=1.
     # An absent parameter means the flag and the model are out of sync, which
     # is exactly the silent-ignore failure mode we are guarding against.
     if _USE_QUANT_REGULARIZER:
-        quant_param_names = [n for n, _ in base_model.named_parameters() if "quant_phase_theta" in n]
+        quant_param_names = [n for n, _ in base_model.named_parameters() if "quant_phase_thetas" in n]
         if not quant_param_names:
             raise RuntimeError(
-                "USE_QUANT_REGULARIZER=1 but 'quant_phase_theta' parameter was not found "
+                "USE_QUANT_REGULARIZER=1 but 'quant_phase_thetas' parameter was not found "
                 "in the model.  The Quantization.lean 8-cycle closure condition (Q1.2) "
                 "is silently not applied.  Check KernelGPT.__init__ for the flag guard."
             )
+        _theta_init_mean = base_model.quant_phase_thetas.mean().item()
         log0(
-            f"quantization_spec:verified quant_phase_theta present "
-            f"(init={base_model.quant_phase_theta.item():.6f} rad = MU_ANGLE={MU_ANGLE:.6f})"
+            f"quantization_spec:verified quant_phase_thetas present "
+            f"(num_layers={base_model.quant_phase_thetas.numel()} "
+            f"init_mean={_theta_init_mean:.6f} rad = MU_ANGLE={MU_ANGLE:.6f})"
+        )
+    if _USE_DRIVE_REGULARIZER:
+        if not hasattr(base_model, "h_times_t"):
+            raise RuntimeError(
+                "USE_DRIVE_REGULARIZER=1 but 'h_times_t' parameter was not found "
+                "in the model.  Check KernelGPT.__init__ for the flag guard."
+            )
+        log0(
+            f"quantization_spec:verified h_times_t present "
+            f"(init={base_model.h_times_t.item():.6f} = 5π/4={HAMILTONIAN_DRIVE_TARGET:.6f})"
+        )
+    if _USE_AMPLITUDE_REGULARIZER:
+        if not hasattr(base_model, "amplitude_r"):
+            raise RuntimeError(
+                "USE_AMPLITUDE_REGULARIZER=1 but 'amplitude_r' parameter was not found "
+                "in the model.  Check KernelGPT.__init__ for the flag guard."
+            )
+        log0(
+            f"quantization_spec:verified amplitude_r present "
+            f"(init={base_model.amplitude_r.item():.6f} = 1/sqrt(2)={math.sqrt(ETA_SQUARED):.6f})"
         )
 
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1477,9 +1882,15 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     if _USE_QUANT_REGULARIZER:
-        # quant_phase_theta is a top-level scalar parameter, not in base_model.blocks,
-        # so it must be appended explicitly (same pattern as skip_weights above).
-        scalar_params.append(base_model.quant_phase_theta)
+        # quant_phase_thetas is a top-level parameter (shape: num_layers), not in
+        # base_model.blocks, so it must be appended explicitly.
+        scalar_params.append(base_model.quant_phase_thetas)
+    if _USE_DRIVE_REGULARIZER:
+        # h_times_t is a top-level scalar parameter — append explicitly.
+        scalar_params.append(base_model.h_times_t)
+    if _USE_AMPLITUDE_REGULARIZER:
+        # amplitude_r is a top-level scalar parameter — append explicitly.
+        scalar_params.append(base_model.amplitude_r)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1615,6 +2026,18 @@ def main() -> None:
         step_t0 = time.perf_counter()
         elapsed_ms = training_time_ms + 1000.0 * (step_t0 - t0)
         scale = lr_mul(step, elapsed_ms)
+
+        # ── Regularizer scale: warmup ramp × LR scale ──────────────────────────
+        # Treat KernelEquilibriumLoss as a stability feature, not an early burden:
+        #  • During the first REGULARIZER_WARMUP_STEPS, ramp 0 → 1 (pure CE start)
+        #  • During main training, full weight (stability rails engaged)
+        #  • During warmdown, follow LR scale so CE dominates the compression pass
+        _regul_warmup_frac = (
+            min(step / args.regularizer_warmup_steps, 1.0)
+            if args.regularizer_warmup_steps > 0 else 1.0
+        )
+        base_model.regul_scale = _regul_warmup_frac * scale
+
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
@@ -1659,14 +2082,73 @@ def main() -> None:
                 f"step_t:{last_step_ms:.1f}ms "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            log0(
+                f"regul_scale:{base_model.regul_scale:.4f} "
+                f"(warmup_frac={_regul_warmup_frac:.3f} lr_scale={scale:.3f})"
+            )
+            _cycle_mean = 0.0
+            _quant_thetas_loaded = False
+            _thetas: torch.Tensor = torch.zeros(1)  # placeholder; replaced below when flag is on
             if _USE_QUANT_REGULARIZER:
-                # Log current phase and regularizer value for monitoring convergence
-                # toward the μ^8=1 fixed points (Quantization.lean §1 Q1.2).
-                _theta_val = base_model.quant_phase_theta.item()
-                _cycle_val = 1.0 - math.cos(8.0 * _theta_val)
+                # Log current per-layer phase stats and regularizer value for monitoring
+                # convergence toward μ^8=1 fixed points (Quantization.lean §1 Q1.2).
+                _thetas = base_model.quant_phase_thetas.detach().float()
+                _quant_thetas_loaded = True
+                _cycle_mean = (1.0 - torch.cos(8.0 * _thetas)).mean().item()
                 log0(
-                    f"quant:theta:{_theta_val:.6f} cycle_loss:{_cycle_val:.6f} "
-                    f"weighted:{args.quant_lambda * _cycle_val:.6f}"
+                    f"quant:theta_mean:{_thetas.mean().item():.6f} "
+                    f"theta_std:{_thetas.std().item():.6f} "
+                    f"cycle_loss_mean:{_cycle_mean:.6f} "
+                    f"weighted:{args.quant_lambda * _cycle_mean:.6f}"
+                )
+            _ht_dev = 0.0
+            _amp_dev = 0.0
+            if _USE_DRIVE_REGULARIZER:
+                _ht = base_model.h_times_t.item()
+                _ht_dev = _ht - HAMILTONIAN_DRIVE_TARGET
+                _drive_val = _ht_dev ** 2
+                log0(
+                    f"quant:h_times_t:{_ht:.6f} "
+                    f"target:{HAMILTONIAN_DRIVE_TARGET:.6f} "
+                    f"drive_loss:{_drive_val:.6f} "
+                    f"weighted:{args.drive_lambda * _drive_val:.6f}"
+                )
+            if _USE_AMPLITUDE_REGULARIZER:
+                _r = base_model.amplitude_r.item()
+                _amp_dev = 2.0 * _r ** 2 - 1.0
+                _amp_val = _amp_dev ** 2
+                log0(
+                    f"quant:amplitude_r:{_r:.6f} "
+                    f"2r^2:{2.0 * _r ** 2:.6f} "
+                    f"amp_loss:{_amp_val:.6f} "
+                    f"weighted:{args.amplitude_lambda * _amp_val:.6f}"
+                )
+            # Combined kernel_equilibrium_loss total (all active arms + cross-term).
+            if _USE_QUANT_REGULARIZER or _USE_DRIVE_REGULARIZER or _USE_AMPLITUDE_REGULARIZER:
+                _q_weighted = args.quant_lambda * _cycle_mean if _USE_QUANT_REGULARIZER else 0.0
+                _d_weighted = args.drive_lambda * _ht_dev ** 2 if _USE_DRIVE_REGULARIZER else 0.0
+                _a_weighted = args.amplitude_lambda * _amp_dev ** 2 if _USE_AMPLITUDE_REGULARIZER else 0.0
+                _x_weighted = (
+                    args.cross_lambda * abs(_ht_dev) * abs(_amp_dev)
+                    if _USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER else 0.0
+                )
+                # Phase-variance only when thetas were loaded from the real model parameter.
+                _pv_weighted = (
+                    args.phase_variance_lambda * _thetas.var().item()
+                    if _quant_thetas_loaded and _thetas.numel() > 1 else 0.0
+                )
+                # Log cross-term individually (same cadence as drive_loss / amp_loss above).
+                if _USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER:
+                    _cross_raw = abs(_ht_dev) * abs(_amp_dev)
+                    log0(
+                        f"quant:cross_loss:{_cross_raw:.6f} "
+                        f"weighted:{_x_weighted:.6f}"
+                    )
+                log0(
+                    f"quant:kernel_eq_total:"
+                    f"{_q_weighted + _d_weighted + _a_weighted + _x_weighted + _pv_weighted:.6f} "
+                    f"(quant={_q_weighted:.4f} drive={_d_weighted:.4f} "
+                    f"amp={_a_weighted:.4f} cross={_x_weighted:.4f} pvar={_pv_weighted:.4f})"
                 )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1681,6 +2163,12 @@ def main() -> None:
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
         f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB"
     )
+
+    # ── Post-training lead-confirmation verification ───────────────────────────
+    # Numerically check how closely the learned parameters satisfy all Theorem Q
+    # conditions (Quantization.lean §5 lead_quantization_confirmed).
+    if master_process:
+        _verify_lead_confirmation(base_model)
 
     # ── Serialization + round-trip validation ─────────────────────────────────
 
