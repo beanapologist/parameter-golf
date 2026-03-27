@@ -55,6 +55,7 @@ from train_gpt_kernel import (
     _USE_QUANT_REGULARIZER,
     _USE_DRIVE_REGULARIZER,
     _USE_AMPLITUDE_REGULARIZER,
+    _GATE_QUANT_TO_CLOSURE,
 )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -583,6 +584,145 @@ def test_phase_variance_penalises_divergence() -> None:
     )
 
 
+# ── Test 18: _GATE_QUANT_TO_CLOSURE flag defaults to False ───────────────────
+
+def test_gate_quant_to_closure_default() -> None:
+    """_GATE_QUANT_TO_CLOSURE must default to False (existing always-on behavior)."""
+    # The env var GATE_QUANT_TO_CLOSURE was not set by this test module.
+    # The module-level os.environ.setdefault calls don't touch this flag.
+    assert not _GATE_QUANT_TO_CLOSURE, (
+        "_GATE_QUANT_TO_CLOSURE must default to False (GATE_QUANT_TO_CLOSURE env var "
+        "not set).  Existing always-on behavior must be preserved by default."
+    )
+    print(f"PASS  test_gate_quant_to_closure_default  (_GATE_QUANT_TO_CLOSURE={_GATE_QUANT_TO_CLOSURE})")
+
+
+# ── Test 19: quant_closure_scale attribute exists and defaults to 1.0 ────────
+
+def test_quant_closure_scale_default() -> None:
+    """KernelGPT must expose quant_closure_scale, defaulting to 1.0 (gate open)."""
+    model = _make_tiny_model()
+    assert hasattr(model, "quant_closure_scale"), (
+        "KernelGPT.quant_closure_scale attribute is missing.  "
+        "The 8-cycle closure gate requires this attribute to communicate "
+        "closure state to the forward pass."
+    )
+    # Default value must be 1.0 so that outside-training-loop use (eval,
+    # post-training check, tests) applies the full quant_lambda.
+    val = model.quant_closure_scale
+    # May be a float or a 0-d tensor (buffer); normalise for comparison.
+    if hasattr(val, "item"):
+        val = val.item()
+    assert abs(val - 1.0) < _EPS, (
+        f"quant_closure_scale must default to 1.0; got {val:.6f}.  "
+        "The gate must be open at initialisation."
+    )
+    print(f"PASS  test_quant_closure_scale_default  (quant_closure_scale={val:.6f})")
+
+
+# ── Test 20: closure gate zeros out quant_lambda on non-closure step ─────────
+
+def test_closure_gate_suppresses_quant_on_non_closure() -> None:
+    """When quant_closure_scale=0.0, quant_lambda arm adds 0 to the loss."""
+    model = _make_tiny_model(quant_lambda=1.0, drive_lambda=0.0, amplitude_lambda=0.0)
+
+    # Shift thetas away from fixed point so quant penalty is non-zero.
+    with torch.no_grad():
+        model.quant_phase_thetas.fill_(MU_ANGLE + math.pi / 8.0)  # midpoint: L=2
+
+    x = torch.zeros(1, 4, dtype=torch.long)
+    y = torch.ones(1, 4, dtype=torch.long)
+
+    # Baseline: gate open (quant_closure_scale=1.0) — quant penalty applies.
+    with torch.no_grad():
+        if hasattr(model.quant_closure_scale, "fill_"):
+            model.quant_closure_scale.fill_(1.0)
+        else:
+            model.quant_closure_scale = 1.0
+        loss_gate_open = model(x, y).item()
+
+    # Gate closed (quant_closure_scale=0.0) — quant penalty must be suppressed.
+    with torch.no_grad():
+        if hasattr(model.quant_closure_scale, "fill_"):
+            model.quant_closure_scale.fill_(0.0)
+        else:
+            model.quant_closure_scale = 0.0
+        loss_gate_closed = model(x, y).item()
+
+    assert loss_gate_closed < loss_gate_open - _EPS, (
+        f"Closing the quant gate (quant_closure_scale=0.0) must reduce the loss "
+        f"when thetas are off-cycle (quant_lambda=1.0, L=2), "
+        f"but gate_open={loss_gate_open:.4f} and gate_closed={loss_gate_closed:.4f}."
+    )
+    print(
+        f"PASS  test_closure_gate_suppresses_quant_on_non_closure  "
+        f"(gate_open={loss_gate_open:.4f} gate_closed={loss_gate_closed:.4f})"
+    )
+
+
+# ── Test 21: closure gate allows quant_lambda on closure step ─────────────────
+
+def test_closure_gate_allows_quant_on_closure() -> None:
+    """When quant_closure_scale=1.0, quant_lambda arm applies normally (closure step)."""
+    model = _make_tiny_model(quant_lambda=1.0, drive_lambda=0.0, amplitude_lambda=0.0)
+
+    with torch.no_grad():
+        model.quant_phase_thetas.fill_(MU_ANGLE + math.pi / 8.0)  # L=2 at midpoint
+
+    x = torch.zeros(1, 4, dtype=torch.long)
+    y = torch.ones(1, 4, dtype=torch.long)
+
+    # quant_lambda=0.0 baseline (CE only).
+    model.quant_lambda = 0.0
+    with torch.no_grad():
+        ce_only = model(x, y).item()
+
+    # Restore lambda and open gate — should exceed pure CE.
+    model.quant_lambda = 1.0
+    with torch.no_grad():
+        if hasattr(model.quant_closure_scale, "fill_"):
+            model.quant_closure_scale.fill_(1.0)
+        else:
+            model.quant_closure_scale = 1.0
+        loss_with_quant = model(x, y).item()
+
+    assert loss_with_quant > ce_only + _EPS, (
+        f"On a closure step (quant_closure_scale=1.0) with quant_lambda=1.0 and "
+        f"off-cycle thetas (L=2), forward loss must exceed pure-CE, "
+        f"but got loss_with_quant={loss_with_quant:.4f} and ce_only={ce_only:.4f}."
+    )
+    print(
+        f"PASS  test_closure_gate_allows_quant_on_closure  "
+        f"(ce_only={ce_only:.4f} with_quant={loss_with_quant:.4f})"
+    )
+
+
+# ── Test 22: 8-cycle closure step-index convention ────────────────────────────
+
+def test_8cycle_closure_step_convention() -> None:
+    """Closure fires at step%MU_ORBIT_SIZE==0 for 0-based step counting."""
+    # Steps 0,8,16,24 must be closure steps in range(25).
+    closure_steps = [s for s in range(3 * MU_ORBIT_SIZE + 1) if s % MU_ORBIT_SIZE == 0]
+    assert closure_steps == [0, 8, 16, 24], (
+        f"8-cycle closure steps must be [0,8,16,24] in range(25); got {closure_steps}"
+    )
+    # Steps 1-7 (within the first orbit) must not be closure steps.
+    for s in range(1, MU_ORBIT_SIZE):
+        assert s % MU_ORBIT_SIZE != 0, (
+            f"Step {s} must not be a closure step (must not satisfy s%{MU_ORBIT_SIZE}==0)"
+        )
+    # Count of closure steps in one full orbit (0-7): exactly 1 (step 0).
+    orbit_closures = sum(1 for s in range(MU_ORBIT_SIZE) if s % MU_ORBIT_SIZE == 0)
+    assert orbit_closures == 1, (
+        f"There must be exactly 1 closure step per {MU_ORBIT_SIZE}-step orbit; "
+        f"got {orbit_closures}"
+    )
+    print(
+        f"PASS  test_8cycle_closure_step_convention  "
+        f"(closure_steps={closure_steps}, orbit_closures_per_period={orbit_closures})"
+    )
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 _TESTS = [
@@ -603,6 +743,11 @@ _TESTS = [
     test_drive_and_amplitude_contribute_to_loss,
     test_cross_term_contributes_to_loss,
     test_phase_variance_penalises_divergence,
+    test_gate_quant_to_closure_default,
+    test_quant_closure_scale_default,
+    test_closure_gate_suppresses_quant_on_non_closure,
+    test_closure_gate_allows_quant_on_closure,
+    test_8cycle_closure_step_convention,
 ]
 
 
