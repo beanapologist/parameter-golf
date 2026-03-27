@@ -14,8 +14,8 @@ model architecture and learning-rate schedule:
 | MLP hidden width multiplier | 3× model_dim | Silver ratio δS ≈ 2.414 × model_dim |
 | Number of attention heads | 8 (arbitrary) | 8 (Z/8Z — each head occupies one μ-orbit slot) |
 | Warmdown LR shape | cosine | Palindrome-precession C(r) = 2r/(1+r²) |
-| Quantization regularizer | — | 8-cycle closure loss λ·(1−cos(8θ)) from Quantization.lean |
-| Feature flags (disabled by default) | — | USE_LYAPUNOV_GAIN, USE_MU_PHASE, USE_PRECESSION, USE_QUANT_REGULARIZER |
+| Quantization regularizer | — | 8-cycle closure loss λ·(1−cos(8θ)) from Quantization.lean (ON by default) |
+| Feature flags (disabled by default) | — | USE_LYAPUNOV_GAIN, USE_MU_PHASE, USE_PRECESSION |
 
 ### 1. Coherence Activation  C(r) = 2r / (1 + r²)
 
@@ -76,8 +76,9 @@ The five conditions of `lead_quantization_confirmed` mapped to Python:
 | Q4.3 `quant_amplitude_coherence_max` | C(1) = 1 | verified in `_selfcheck_quantization_spec()` |
 | Q2.2 `quant_energy_ground` | E₁ = −1 | verified in `_selfcheck_quantization_spec()` |
 
-The regularizer is **disabled by default** (zero impact on baseline runs); enable it with
-`USE_QUANT_REGULARIZER=1` and tune its weight with `QUANT_LAMBDA` (default `0.01`).
+The regularizer is **enabled by default** (`USE_QUANT_REGULARIZER=1`).  It starts at zero
+penalty because `MU_ANGLE = 3π/4` is already a fixed point.  Set `USE_QUANT_REGULARIZER=0`
+to reproduce the original unregularized run (e.g. for ablation).
 
 ### Tokenizer / Dataset
 
@@ -97,6 +98,8 @@ conditions to all prior submissions.
 cd records/track_10min_16mb/2026-03-26_KernelConst_CoherenceAct_SilverMLP_Z8Z_PalindromeLR
 
 # Standard run (seed 1337, 600s wall-clock cap, 9000-step budget)
+# USE_QUANT_REGULARIZER defaults to 1 — the Quantization.lean 8-cycle closure
+# condition (Q1.2 μ^8=1) is enforced during training out of the box.
 NUM_LAYERS=9 \
 ITERATIONS=9000 WARMDOWN_ITERS=3000 MAX_WALLCLOCK_SECONDS=600 \
 MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035 \
@@ -108,7 +111,8 @@ TOKENIZER_PATH=../../../data/tokenizers/fineweb_1024_bpe.model \
 torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
 
-To additionally enable the **8-cycle closure quantization regularizer** (Quantization.lean §1 Q1.2):
+To reproduce the **original unregularized run** (before the quantization fix), explicitly
+disable the regularizer:
 
 ```bash
 NUM_LAYERS=9 \
@@ -116,15 +120,12 @@ ITERATIONS=9000 WARMDOWN_ITERS=3000 MAX_WALLCLOCK_SECONDS=600 \
 MATRIX_LR=0.025 SCALAR_LR=0.025 TIED_EMBED_LR=0.035 \
 MUON_MOMENTUM=0.99 MUON_MOMENTUM_WARMUP_START=0.92 \
 MUON_MOMENTUM_WARMUP_STEPS=1500 \
-USE_QUANT_REGULARIZER=1 QUANT_LAMBDA=0.01 \
+USE_QUANT_REGULARIZER=0 \
 SEED=1337 \
 DATA_PATH=../../../data/datasets/fineweb10B_sp1024 \
 TOKENIZER_PATH=../../../data/tokenizers/fineweb_1024_bpe.model \
-torchrun --standalone --nproc_per_node=8 ../../../train_gpt_kernel.py
+torchrun --standalone --nproc_per_node=8 train_gpt.py
 ```
-
-Note: the quantization regularizer is implemented in `train_gpt_kernel.py` (the root-level
-script); `train_gpt.py` in this folder is the historical snapshot of the original run.
 
 The script writes a log file to `logs/<run_id>.txt` (printed as the first line of stdout).
 Run twice more with `SEED=42` and `SEED=2025` to produce the three replicate logs needed for
@@ -167,15 +168,15 @@ All other imports are from the Python standard library.
 | `LOGIT_SOFTCAP` | `30.0` | Logit soft-cap |
 | `TIE_EMBEDDINGS` | `1` | Tie input/output embeddings |
 
-### Experimental kernel feature flags (all OFF by default)
+### Experimental kernel feature flags
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `USE_QUANT_REGULARIZER` | **`1`** | Add 8-cycle closure loss λ·(1−cos(8θ)) to BPB loss (Quantization.lean §1 Q1.2) — **ON by default** |
+| `QUANT_LAMBDA` | `0.01` | Weight of the quantization regularizer |
 | `USE_LYAPUNOV_GAIN` | `0` | Scale QK dot-products by Lyapunov gain from §10 |
 | `USE_MU_PHASE` | `0` | Initialise each head's RoPE phase from μ-orbit slot |
 | `USE_PRECESSION` | `0` | Enable slow precession via PRECESSION_DELTA_PHI per step |
-| `USE_QUANT_REGULARIZER` | `0` | Add 8-cycle closure loss λ·(1−cos(8θ)) to BPB loss (Quantization.lean §1 Q1.2) |
-| `QUANT_LAMBDA` | `0.01` | Weight of the quantization regularizer (only active when `USE_QUANT_REGULARIZER=1`) |
 | `KERNEL_SELFTEST` | `0` | Run built-in kernel-constant unit tests and exit |
 
 ### Training schedule
@@ -204,7 +205,11 @@ The script writes one log file per process-group to `logs/<run_id>.txt`.  Key li
 ```
 logs/<run-id>.txt               # first line: path to log file
 kernel:silver_ratio:2.414214 …  # kernel constants in effect
-kernel:quant_regularizer:…      # quantization regularizer config (when USE_QUANT_REGULARIZER=1)
+quantization_spec:source …      # Quantization.lean spec loaded
+quantization_spec:Q1.2(mu^8=1) regularizer=ENABLED …
+                                # all 5 Quantization.lean conditions logged; DISABLED warns
+quantization_spec:verified quant_phase_theta present …
+                                # confirms quant_phase_theta is wired (when USE_QUANT_REGULARIZER=1)
 train_loader:dataset:…          # dataset confirmed
 val_loader:shards …             # validation shard count and token count
 model_params:…                  # total parameter count
@@ -219,6 +224,32 @@ stopping_early: wallclock_cap   # emitted when MAX_WALLCLOCK_SECONDS is reached
 final_int8_zlib_roundtrip val_loss:… val_bpb:…
                                 # round-trip accuracy after int8 quantization + zlib
 peak memory allocated: … MiB    # GPU memory high-water mark
+```
+
+### How to Verify Quantization.lean is Active
+
+After starting a run, look for these lines in the log file to confirm the
+spec is loaded and the regularizer is wired:
+
+```
+quantization_spec:source formal-lean/Quantization.lean (lead_quantization_confirmed)
+quantization_spec:Q1.2(mu^8=1) regularizer=ENABLED lambda=0.0100 theta_init=2.356194
+quantization_spec:Q4.3(C(1)=1) constants_verified=True training_applied=True (coherence activation in every MLP block)
+quantization_spec:verified quant_phase_theta present (init=2.356194 rad = MU_ANGLE=2.356194)
+```
+
+If instead you see:
+```
+quantization_spec:Q1.2(mu^8=1) regularizer=DISABLED (set USE_QUANT_REGULARIZER=1) …
+quantization_spec:WARNING USE_QUANT_REGULARIZER=0 …
+```
+the regularizer is off and the 8-cycle closure condition is **not** being enforced.
+
+To run the smoke test that verifies the quantization pipeline end-to-end:
+
+```bash
+# From repository root — no GPU required
+python tests/test_quantization_smoke.py
 ```
 
 ### Statistical Significance Requirement  (p < 0.01)
