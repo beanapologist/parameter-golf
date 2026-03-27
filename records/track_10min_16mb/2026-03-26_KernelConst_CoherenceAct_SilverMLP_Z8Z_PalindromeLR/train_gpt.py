@@ -1529,7 +1529,12 @@ class KernelGPT(nn.Module):
         # the warmup ramp × LR scale product (see main()).  Initialised to 1.0
         # for direct use of the model outside the training loop (evaluation,
         # post-training verification, tests).
-        self.regul_scale: float = 1.0
+        # Registered as a buffer (not a float) so TorchDynamo treats it as a
+        # stable tensor rather than guarding on its Python scalar value — which
+        # would trigger a recompile every step and hit the default recompile
+        # limit under fullgraph=True.  The training loop updates it in-place
+        # with .fill_() before each forward pass.
+        self.register_buffer("regul_scale", torch.tensor(1.0, dtype=torch.float32))
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -1865,7 +1870,9 @@ def main() -> None:
             f"(init={base_model.amplitude_r.item():.6f} = 1/sqrt(2)={math.sqrt(ETA_SQUARED):.6f})"
         )
 
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    # fullgraph=False: allows Dynamo to fall back gracefully instead of
+    # hard-crashing on any residual guard misses (e.g. from per-step scalars).
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
@@ -2036,7 +2043,7 @@ def main() -> None:
             min(step / args.regularizer_warmup_steps, 1.0)
             if args.regularizer_warmup_steps > 0 else 1.0
         )
-        base_model.regul_scale = _regul_warmup_frac * scale
+        base_model.regul_scale.fill_(_regul_warmup_frac * scale)
 
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
@@ -2083,7 +2090,7 @@ def main() -> None:
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
             log0(
-                f"regul_scale:{base_model.regul_scale:.4f} "
+                f"regul_scale:{base_model.regul_scale.item():.4f} "
                 f"(warmup_frac={_regul_warmup_frac:.3f} lr_scale={scale:.3f})"
             )
             _cycle_mean = 0.0
