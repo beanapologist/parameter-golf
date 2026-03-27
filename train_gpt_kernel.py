@@ -1568,9 +1568,20 @@ class KernelGPT(nn.Module):
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
         if _USE_QUANT_REGULARIZER or _USE_DRIVE_REGULARIZER or _USE_AMPLITUDE_REGULARIZER:
-            # KernelEquilibriumLoss: unified soft regularizer for lead_quantization_confirmed.
-            # NOTE: This approximates Theorem Q via gradient descent; it does not strictly
-            # enforce the five conditions simultaneously (see module docstring disclaimer).
+            # ── KernelEquilibriumLoss: Lean Theorem Q → code mapping ─────────────────
+            # Soft regularizer for lead_quantization_confirmed (Quantization.lean §5).
+            # Each active arm targets one condition of the five-condition theorem:
+            #
+            #   Lean condition                      | Arm                    | Active when
+            #   ────────────────────────────────────┼────────────────────────┼─────────────────────
+            #   Q1.2 quant_phase_eight_cycle μ^8=1  | quant_phase_thetas     | USE_QUANT_REGULARIZER
+            #   Q3.2 quant_floquet_recipe H·T=5π/4  | h_times_t              | USE_DRIVE_REGULARIZER
+            #   Q4.1 quant_amplitude_balance 2η²=1  | amplitude_r            | USE_AMPLITUDE_REGULARIZER
+            #   joint Q3.2+Q4.1 simultaneous        | cross-term             | both drive + amplitude
+            #   global Z/8Z coherence across layers | phase-variance         | phase_variance_lambda>0
+            #
+            # NOTE: gradient descent only pushes toward these fixed points; exact
+            # simultaneous satisfaction is not guaranteed (see module docstring).
             _quant_thetas = self.quant_phase_thetas if _USE_QUANT_REGULARIZER else self.tok_emb.weight.new_zeros(1)
             _h_t = self.h_times_t if _USE_DRIVE_REGULARIZER else self.tok_emb.weight.new_tensor(HAMILTONIAN_DRIVE_TARGET)
             _amp_r = self.amplitude_r if _USE_AMPLITUDE_REGULARIZER else self.tok_emb.weight.new_tensor(math.sqrt(ETA_SQUARED))
