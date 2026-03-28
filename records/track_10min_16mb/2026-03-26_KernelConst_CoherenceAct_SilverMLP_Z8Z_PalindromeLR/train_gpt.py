@@ -593,6 +593,17 @@ class Hyperparameters:
     tunneling_lambda: float = float(os.environ.get("TUNNELING_LAMBDA", 0.005))
     tunneling_e_kev: float = float(os.environ.get("TUNNELING_E_KEV", 120.0))
 
+    # ── DDP unused-parameter safety valve ─────────────────────────────────────
+    # The primary fix is in kernel_equilibrium_loss: the three learnable
+    # regularizer parameters (quant_phase_thetas, h_times_t, amplitude_r) are
+    # always included in the autograd graph even when regul_scale=0 (warmup).
+    # Set FIND_UNUSED_PARAMETERS=1 as an extra safety net (e.g. when adding
+    # new optional model branches) or to suppress the DDP crash under any
+    # future conditional-gradient scenario. Incurs a small per-step overhead
+    # (~5–15% depending on world size) so defaults to off.
+    # For verbose per-rank diagnosis: TORCH_DISTRIBUTED_DEBUG=DETAIL
+    find_unused_parameters: bool = os.environ.get("FIND_UNUSED_PARAMETERS", "0") == "1"
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MUON OPTIMIZER  (unchanged from baseline train_gpt.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1253,16 +1264,30 @@ def kernel_equilibrium_loss(
     Returns:
         Scalar non-negative regularization loss.
     """
+    # DDP / autograd correctness: the three primary arms (Q1.2, Q3.2, Q4.1)
+    # are always included in the loss expression — even when the effective
+    # lambda is zero (e.g. during the regularizer warmup window where
+    # regul_scale=0.0).  This keeps quant_phase_thetas, h_times_t, and
+    # amplitude_r in the autograd computation graph on every forward pass so
+    # that DDP sees a defined (possibly zero) gradient for each parameter.
+    #
+    # Without this, DDP raises:
+    #   RuntimeError: Expected to have finished reduction in the prior
+    #   iteration before starting a new one. This error indicates that your
+    #   module has parameters that were not used in producing loss.
+    # (logged as "Parameter indices which did not receive grad: …")
+    #
+    # Note: when lambda is a 0-valued tensor, multiplying by it still
+    # registers the computation in the autograd graph; backward propagates
+    # a zero gradient, which satisfies DDP's reduction requirement.
+    # To debug per-rank gradient coverage: TORCH_DISTRIBUTED_DEBUG=DETAIL
     loss = quant_phase_thetas.new_zeros(())
-    if quant_lambda > 0.0:
-        loss = loss + quant_lambda * eight_cycle_loss(quant_phase_thetas).mean()
+    loss = loss + quant_lambda * eight_cycle_loss(quant_phase_thetas).mean()
     # Compute raw deviations once, reused by drive, amplitude, and cross terms.
     drive_raw = h_times_t - HAMILTONIAN_DRIVE_TARGET           # H·T − 5π/4
     amp_raw = 2.0 * amplitude_r.square() - 1.0                 # 2r² − 1
-    if drive_lambda > 0.0:
-        loss = loss + drive_lambda * drive_raw.square()
-    if amplitude_lambda > 0.0:
-        loss = loss + amplitude_lambda * amp_raw.square()
+    loss = loss + drive_lambda * drive_raw.square()
+    loss = loss + amplitude_lambda * amp_raw.square()
     if cross_lambda > 0.0:
         # Cross-term: |H·T − 5π/4| · |2r² − 1|  (zero when either arm is satisfied).
         # Encourages simultaneous satisfaction of Q3.2 and Q4.1, mirroring the
@@ -2043,7 +2068,17 @@ def main() -> None:
     # fullgraph=False: allows Dynamo to fall back gracefully instead of
     # hard-crashing on any residual guard misses (e.g. from per-step scalars).
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=False)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    # find_unused_parameters: the primary fix for the DDP "unused parameters"
+    # crash is in kernel_equilibrium_loss (the three regularizer parameters are
+    # now always in the autograd graph).  args.find_unused_parameters adds a
+    # secondary safety net for any future conditional-gradient scenario; it
+    # defaults to False to avoid the per-step bookkeeping overhead.
+    model: nn.Module = DDP(
+        compiled_model,
+        device_ids=[local_rank],
+        broadcast_buffers=False,
+        find_unused_parameters=args.find_unused_parameters,
+    ) if distributed else compiled_model
 
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
