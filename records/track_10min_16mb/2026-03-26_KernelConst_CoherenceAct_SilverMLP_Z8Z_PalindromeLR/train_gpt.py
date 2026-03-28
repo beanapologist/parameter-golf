@@ -113,6 +113,18 @@ FLOQUET_PHASE: float = math.pi               # ε_F · T = π
 HAMILTONIAN_DRIVE_TARGET: float = 5.0 * math.pi / 4.0  # H·T = 5π/4
 
 # ─────────────────────────────────────────────────────────────────────────────
+# COMPUTATIONAL TUNNELING CONSTANTS  (NIST-validated D-D, Q7)
+# P_Q(E) = [exp(−2π·η(E))]^γ,  η = 2πα / sqrt(2E/μ)  (Sommerfeld parameter)
+# ─────────────────────────────────────────────────────────────────────────────
+NIST_D_MASS_U: float = 2.01410177812        # deuterium mass, u (NIST 2021)
+U_TO_MEV: float = 931.49410242              # u → MeV/c² (NIST CODATA 2018)
+REDUCED_MASS_DD_MEV: float = (NIST_D_MASS_U * U_TO_MEV) / 2.0  # μ = m_D/2
+ALPHA: float = 1.0 / 137.035999            # fine-structure constant
+TUNNELING_GAMMA: float = 0.02              # exponent γ in P_Q formula
+TUNNELING_MIN_SCALE: float = 0.1           # clamp on |tunneling_energy_scale|
+TUNNELING_LOG_EPS: float = 1e-8            # ε inside log(P_Q + ε)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # PALINDROME PRECESSION LR FORMULA  (CriticalEigenvalue.lean §9 + §16)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -375,6 +387,41 @@ def _selfcheck_quantization_spec() -> None:
 
 _selfcheck_quantization_spec()
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMPUTATIONAL TUNNELING FUNCTIONS  (NIST-validated D-D, Q7)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def gamow_sommerfeld(E_keV: float) -> float:
+    """Sommerfeld parameter η(E) = 2πα / sqrt(2·E_MeV/μ) for D-D."""
+    E_MeV = E_keV / 1000.0
+    v_over_c = math.sqrt(2.0 * E_MeV / REDUCED_MASS_DD_MEV)
+    return (2.0 * math.pi * ALPHA) / v_over_c
+
+
+def computational_tunneling_prob(E_keV: float, gamma: float = TUNNELING_GAMMA) -> float:
+    """P_Q(E) = exp(−2π·η(E))^γ — D-D Gamow tunneling probability."""
+    eta = gamow_sommerfeld(E_keV)
+    return math.exp(-2.0 * math.pi * eta) ** gamma
+
+
+def _selfcheck_tunneling_constants() -> None:
+    """Import-time sanity check: NIST mass, ALPHA, and P_Q monotonicity."""
+    _eps = 1e-8
+    assert abs(REDUCED_MASS_DD_MEV - (NIST_D_MASS_U * U_TO_MEV) / 2.0) < _eps, (
+        f"REDUCED_MASS_DD_MEV mismatch; got {REDUCED_MASS_DD_MEV:.8f}"
+    )
+    assert abs(ALPHA - 1.0 / 137.035999) < _eps, (
+        f"ALPHA must equal 1/137.035999; got {ALPHA:.10f}"
+    )
+    _p_lo, _p_hi = computational_tunneling_prob(50.0), computational_tunneling_prob(200.0)
+    assert 0.0 < _p_lo < _p_hi <= 1.0, (
+        f"P_Q must be in (0,1] and increase with E; P_Q(50)={_p_lo:.6f} P_Q(200)={_p_hi:.6f}"
+    )
+
+
+_selfcheck_tunneling_constants()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FEATURE FLAGS  (env-var-gated; all default to off — baseline behavior unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -413,6 +460,8 @@ _USE_AMPLITUDE_REGULARIZER: bool = os.environ.get("USE_AMPLITUDE_REGULARIZER", "
 # On non-closure steps only the cheap (s) path (phase-advance/CE) applies.
 # Default 0 = existing always-on behavior for backward compatibility.
 _GATE_QUANT_TO_CLOSURE: bool = os.environ.get("GATE_QUANT_TO_CLOSURE", "0") == "1"
+# Q7 D-D tunneling regularizer (Gamow factor); off by default (USE_TUNNELING_REGULARIZER=1 to activate).
+_USE_TUNNELING_REGULARIZER: bool = os.environ.get("USE_TUNNELING_REGULARIZER", "0") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
@@ -538,6 +587,11 @@ class Hyperparameters:
     # before the regularizers start pulling toward the equilibrium manifold.
     # Set to 0 to disable ramping (constant λ throughout, original behaviour).
     regularizer_warmup_steps = int(os.environ.get("REGULARIZER_WARMUP_STEPS", 300))
+
+    # ── Q7 Tunneling ──────────────────────────────────────────────────────────
+    use_tunneling_regularizer: bool = os.environ.get("USE_TUNNELING_REGULARIZER", "0") == "1"
+    tunneling_lambda: float = float(os.environ.get("TUNNELING_LAMBDA", 0.005))
+    tunneling_e_kev: float = float(os.environ.get("TUNNELING_E_KEV", 120.0))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MUON OPTIMIZER  (unchanged from baseline train_gpt.py)
@@ -1165,6 +1219,9 @@ def kernel_equilibrium_loss(
     amplitude_lambda: float,
     cross_lambda: float = 0.0,
     phase_variance_lambda: float = 0.0,
+    tunneling_lambda: float = 0.0,
+    tunneling_energy_scale: "Tensor | None" = None,
+    tunneling_e_kev: float = 120.0,
 ) -> Tensor:
     """Unified KernelEquilibriumLoss: assembles all Theorem Q regularizers.
 
@@ -1175,27 +1232,23 @@ def kernel_equilibrium_loss(
       Q4.1  Amplitude balance:    λ_a  · (2r² − 1)²
       Joint cross-term:           λ_x  · |H·T − 5π/4| · |2r² − 1|
       Phase-variance coherence:   λ_v  · Var(θ_l)
+      Q7    Tunneling:            λ_t  · (−log(P_Q(eff_E) + ε))
 
-    The cross-term is zero when *either* Q3.2 or Q4.1 is satisfied, and is
-    non-zero only when both conditions are simultaneously violated — mirroring
-    the "simultaneous validity" proved in lead_quantization_confirmed.
-
-    The phase-variance term penalises spread across the per-layer θ_l parameters,
-    encouraging all transformer blocks to converge to the same Z/8Z orbit point.
-
-    NOTE: This is a soft approximation — satisfying all terms to zero would
-    imply lead_quantization_confirmed, but gradient descent only pushes toward
-    those fixed points without guaranteeing exact satisfaction.
+    NOTE: soft approximation — gradient descent pushes toward fixed points
+    without guaranteeing exact simultaneous satisfaction.
 
     Args:
-        quant_phase_thetas:    per-layer phase tensor of shape (num_layers,).
-        h_times_t:             scalar tensor for learnable Hamiltonian product H·T.
-        amplitude_r:           scalar tensor for learnable amplitude ratio η.
-        quant_lambda:          weight for the 8-cycle closure term (Q1.2).
-        drive_lambda:          weight for the Hamiltonian drive term (Q3.2).
-        amplitude_lambda:      weight for the amplitude balance term (Q4.1).
-        cross_lambda:          weight for the joint Q3.2+Q4.1 cross-term.
-        phase_variance_lambda: weight for the per-layer phase-variance term.
+        quant_phase_thetas:     per-layer phase tensor (num_layers,).
+        h_times_t:              learnable H·T scalar tensor.
+        amplitude_r:            learnable amplitude ratio η tensor.
+        quant_lambda:           weight for Q1.2 8-cycle closure.
+        drive_lambda:           weight for Q3.2 Hamiltonian drive.
+        amplitude_lambda:       weight for Q4.1 amplitude balance.
+        cross_lambda:           weight for joint Q3.2+Q4.1 cross-term.
+        phase_variance_lambda:  weight for phase-variance coherence.
+        tunneling_lambda:       weight for Q7 tunneling (0 = disabled).
+        tunneling_energy_scale: learnable energy scale scalar; None = disabled.
+        tunneling_e_kev:        base energy in keV (default 120.0).
 
     Returns:
         Scalar non-negative regularization loss.
@@ -1219,6 +1272,12 @@ def kernel_equilibrium_loss(
         # Phase-variance: Var(θ_l) across layers.  Zero when all layers share
         # the same orbit point; positive when they diverge.
         loss = loss + phase_variance_lambda * quant_phase_thetas.var()
+    if tunneling_lambda > 0.0 and tunneling_energy_scale is not None:
+        effective_E_kev = tunneling_e_kev * tunneling_energy_scale.abs().clamp(min=TUNNELING_MIN_SCALE)
+        v_over_c = torch.sqrt(2.0 * (effective_E_kev / 1000.0) / REDUCED_MASS_DD_MEV)
+        eta_t = (2.0 * math.pi * ALPHA) / v_over_c
+        p_q_t = torch.exp(-2.0 * math.pi * TUNNELING_GAMMA * eta_t)
+        loss = loss + tunneling_lambda * (-torch.log(p_q_t + TUNNELING_LOG_EPS))
     return loss
 
 
@@ -1381,6 +1440,28 @@ def _run_kernel_selftest() -> None:
         "KERNEL_SELFTEST: steps 1-7 must not be 8-cycle closure steps"
     )
 
+    # ── Computational tunneling (Q7) — NIST D-D Gamow factor ─────────────────
+
+    # Parity: PyTorch formula matches scalar Python at the default energy.
+    _scale = torch.tensor(1.0)
+    _eff_E_kev = 120.0 * _scale.abs().clamp(min=TUNNELING_MIN_SCALE)
+    _pq_t = torch.exp(-2.0 * math.pi * TUNNELING_GAMMA * (2.0 * math.pi * ALPHA)
+                      / torch.sqrt(2.0 * (_eff_E_kev / 1000.0) / REDUCED_MASS_DD_MEV)).item()
+    _pq_py = computational_tunneling_prob(120.0)
+    assert abs(_pq_t - _pq_py) < _eps, (
+        f"KERNEL_SELFTEST: torch/python P_Q parity at 120 keV: {_pq_t:.8f} vs {_pq_py:.8f}"
+    )
+
+    # Differentiability: gradient must flow through the full Gamow chain.
+    _tun_scale = torch.tensor(1.0, requires_grad=True)
+    _eff = 120.0 * _tun_scale.abs().clamp(min=TUNNELING_MIN_SCALE)
+    _pq_diff = torch.exp(-2.0 * math.pi * TUNNELING_GAMMA * (2.0 * math.pi * ALPHA)
+                         / torch.sqrt(2.0 * (_eff / 1000.0) / REDUCED_MASS_DD_MEV))
+    (-torch.log(_pq_diff + TUNNELING_LOG_EPS)).backward()
+    assert _tun_scale.grad is not None and abs(_tun_scale.grad.item()) > 0.0, (
+        "KERNEL_SELFTEST: tunneling loss must have non-zero gradient w.r.t. tunneling_energy_scale"
+    )
+
     print("kernel_selftest: all checks PASSED ✓")
 
 
@@ -1464,6 +1545,22 @@ def _verify_lead_confirmation(model: "KernelGPT") -> None:
     e1_dev = abs(-1.0 / (1 ** 2) - (-1.0))
     print(fmt.format("Q6", "E₁ = −1", "Q2.2", f"{e1_dev:.2e}", "EXACT (by construction)"))
 
+    # Q7  Computational tunneling (new — NIST D-D, USE_TUNNELING_REGULARIZER)
+    if hasattr(model, "tunneling_energy_scale"):
+        scale_val = model.tunneling_energy_scale.detach().float().item()
+        _tun_e_kev = float(os.environ.get("TUNNELING_E_KEV", 120.0))
+        eff_E = _tun_e_kev * abs(scale_val)
+        p_q_val = computational_tunneling_prob(eff_E)
+        print(fmt.format(
+            "Q7",
+            f"P_Q({eff_E:.1f} keV)={p_q_val:.5f}",
+            "new",
+            f"scale={scale_val:.4f}",
+            "ACTIVE",
+        ))
+    else:
+        print(fmt.format("Q7", "D-D tunneling (P_Q)", "new", "n/a", "DISABLED"))
+
     print(sep)
     if devs:
         overall = max(devs)
@@ -1542,6 +1639,8 @@ class KernelGPT(nn.Module):
         amplitude_lambda: float = 0.01,
         cross_lambda: float = 0.005,
         phase_variance_lambda: float = 0.0,
+        use_tunneling_regularizer: bool = False,
+        tunneling_lambda: float = 0.005,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -1554,6 +1653,8 @@ class KernelGPT(nn.Module):
         self.amplitude_lambda: float = amplitude_lambda
         self.cross_lambda: float = cross_lambda
         self.phase_variance_lambda: float = phase_variance_lambda
+        self.use_tunneling_regularizer: bool = use_tunneling_regularizer
+        self.tunneling_lambda: float = tunneling_lambda
         # regul_scale ∈ [0, 1]: updated by the training loop each step via
         # the warmup ramp × LR scale product (see main()).  Initialised to 1.0
         # for direct use of the model outside the training loop (evaluation,
@@ -1605,6 +1706,9 @@ class KernelGPT(nn.Module):
             # 2η² = 1 and the coherence function reaches its maximum C(1) = 1.
             # Ref: Quantization.lean §4 Q4.1 (quant_amplitude_balance: 2η² = 1).
             self.amplitude_r = nn.Parameter(torch.tensor(math.sqrt(ETA_SQUARED), dtype=torch.float32))
+        if use_tunneling_regularizer:
+            # Learnable scale on the D-D tunneling evaluation energy (Q7); init=1 → eff_E=tunneling_e_kev.
+            self.tunneling_energy_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -1638,7 +1742,7 @@ class KernelGPT(nn.Module):
             logits_proj = self.lm_head(x)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
         loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        if _USE_QUANT_REGULARIZER or _USE_DRIVE_REGULARIZER or _USE_AMPLITUDE_REGULARIZER:
+        if _USE_QUANT_REGULARIZER or _USE_DRIVE_REGULARIZER or _USE_AMPLITUDE_REGULARIZER or _USE_TUNNELING_REGULARIZER:
             # ── KernelEquilibriumLoss: Lean Theorem Q → code mapping ─────────────────
             # Soft regularizer for lead_quantization_confirmed (Quantization.lean §5).
             # Each active arm targets one condition of the five-condition theorem:
@@ -1650,6 +1754,7 @@ class KernelGPT(nn.Module):
             #   Q4.1 quant_amplitude_balance 2η²=1  | amplitude_r            | USE_AMPLITUDE_REGULARIZER
             #   joint Q3.2+Q4.1 simultaneous        | cross-term             | both drive + amplitude
             #   global Z/8Z coherence across layers | phase-variance         | phase_variance_lambda>0
+            #   Q7   D-D tunneling P_Q maximization | tunneling_energy_scale | USE_TUNNELING_REGULARIZER
             #
             # NOTE: gradient descent only pushes toward these fixed points; exact
             # simultaneous satisfaction is not guaranteed (see module docstring).
@@ -1665,6 +1770,9 @@ class KernelGPT(nn.Module):
                 (self.amplitude_lambda if _USE_AMPLITUDE_REGULARIZER else 0.0) * self.regul_scale,
                 cross_lambda=(self.cross_lambda if (_USE_DRIVE_REGULARIZER and _USE_AMPLITUDE_REGULARIZER) else 0.0) * self.regul_scale,
                 phase_variance_lambda=(self.phase_variance_lambda if _USE_QUANT_REGULARIZER else 0.0) * self.regul_scale,
+                tunneling_lambda=(self.tunneling_lambda if self.use_tunneling_regularizer else 0.0) * self.regul_scale,
+                tunneling_energy_scale=getattr(self, "tunneling_energy_scale", None) if self.use_tunneling_regularizer else None,
+                tunneling_e_kev=float(os.environ.get("TUNNELING_E_KEV", 120.0)),
             )
         return loss
 
@@ -1823,6 +1931,12 @@ def main() -> None:
             "the amplitude balance condition (Q4.1 2eta^2=1) is NOT enforced "
             "during training.  Re-run with USE_AMPLITUDE_REGULARIZER=1 to activate."
         )
+    # Q7 tunneling status.
+    log0(
+        f"quantization_spec:Q7(tunneling) "
+        f"{'ENABLED' if _USE_TUNNELING_REGULARIZER else 'DISABLED'} "
+        f"lambda={args.tunneling_lambda:.4f} e_kev={args.tunneling_e_kev:.1f} gamma={TUNNELING_GAMMA}"
+    )
 
     # ── Seed + tokenizer ──────────────────────────────────────────────────────
 
@@ -1867,6 +1981,8 @@ def main() -> None:
         amplitude_lambda=args.amplitude_lambda,
         cross_lambda=args.cross_lambda,
         phase_variance_lambda=args.phase_variance_lambda,
+        use_tunneling_regularizer=args.use_tunneling_regularizer,
+        tunneling_lambda=args.tunneling_lambda,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1911,6 +2027,18 @@ def main() -> None:
             f"quantization_spec:verified amplitude_r present "
             f"(init={base_model.amplitude_r.item():.6f} = 1/sqrt(2)={math.sqrt(ETA_SQUARED):.6f})"
         )
+    if _USE_TUNNELING_REGULARIZER:
+        if not hasattr(base_model, "tunneling_energy_scale"):
+            raise RuntimeError(
+                "USE_TUNNELING_REGULARIZER=1 but 'tunneling_energy_scale' not found; "
+                "check KernelGPT.__init__ use_tunneling_regularizer guard."
+            )
+        _tun_scale_init = base_model.tunneling_energy_scale.item()
+        _tun_p_q_init = computational_tunneling_prob(args.tunneling_e_kev * abs(_tun_scale_init))
+        log0(
+            f"quantization_spec:verified tunneling_energy_scale "
+            f"init={_tun_scale_init:.4f} P_Q={_tun_p_q_init:.5f} lambda={args.tunneling_lambda:.4f}"
+        )
 
     # fullgraph=False: allows Dynamo to fall back gracefully instead of
     # hard-crashing on any residual guard misses (e.g. from per-step scalars).
@@ -1940,6 +2068,9 @@ def main() -> None:
     if _USE_AMPLITUDE_REGULARIZER:
         # amplitude_r is a top-level scalar parameter — append explicitly.
         scalar_params.append(base_model.amplitude_r)
+    if _USE_TUNNELING_REGULARIZER:
+        # tunneling_energy_scale is a top-level scalar parameter — append explicitly.
+        scalar_params.append(base_model.tunneling_energy_scale)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -2278,6 +2409,17 @@ def main() -> None:
                     f"{_q_weighted + _d_weighted + _a_weighted + _x_weighted + _pv_weighted:.6f} "
                     f"(quant={_q_weighted:.4f} drive={_d_weighted:.4f} "
                     f"amp={_a_weighted:.4f} cross={_x_weighted:.4f} pvar={_pv_weighted:.4f})"
+                )
+            # Q7 Tunneling log (when USE_TUNNELING_REGULARIZER=1).
+            if _USE_TUNNELING_REGULARIZER and hasattr(base_model, "tunneling_energy_scale"):
+                _tun_scale = base_model.tunneling_energy_scale.item()
+                _tun_eff_E = args.tunneling_e_kev * abs(_tun_scale)
+                _tun_p_q = computational_tunneling_prob(_tun_eff_E)
+                log0(
+                    f"tunneling:eff_E={_tun_eff_E:.1f} keV "
+                    f"P_Q={_tun_p_q:.5f} "
+                    f"scale={_tun_scale:.4f} "
+                    f"weighted:{args.tunneling_lambda * (-math.log(_tun_p_q + TUNNELING_LOG_EPS)):.6f}"
                 )
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
