@@ -113,40 +113,16 @@ FLOQUET_PHASE: float = math.pi               # ε_F · T = π
 HAMILTONIAN_DRIVE_TARGET: float = 5.0 * math.pi / 4.0  # H·T = 5π/4
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPUTATIONAL TUNNELING CONSTANTS  (NIST-validated D-D)
-# Ref: https://www.nist.gov/pml/atomic-weights-and-isotopic-compositions-relative-atomic-masses
-# Used by the Kernel Quantization System tunneling regularizer (Q7).
-# Formula: P_Q(E) = [exp(−2π·η(E))]^{TUNNELING_GAMMA}
-#   where η(E) = 2π·α / sqrt(2·E/m_reduced) is the Sommerfeld parameter.
+# COMPUTATIONAL TUNNELING CONSTANTS  (NIST-validated D-D, Q7)
+# P_Q(E) = [exp(−2π·η(E))]^γ,  η = 2πα / sqrt(2E/μ)  (Sommerfeld parameter)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# NIST deuterium atomic mass in unified atomic mass units (u).
-# Source: NIST Atomic Weights and Isotopic Compositions (2021), ²H.
-NIST_D_MASS_U: float = 2.01410177812
-
-# Conversion from atomic mass units to MeV/c² (NIST CODATA 2018).
-U_TO_MEV: float = 931.49410242
-
-# Reduced mass for symmetric D-D system: μ = m_D / 2 (equal-mass two-body).
-# In MeV/c²: used in the Gamow factor velocity v/c = sqrt(2·E_MeV/m_reduced).
-REDUCED_MASS_DD_MEV: float = (NIST_D_MASS_U * U_TO_MEV) / 2.0
-
-# Fine-structure constant (NIST CODATA 2018): α = e²/(4πε₀ℏc) ≈ 1/137.036.
-ALPHA: float = 1.0 / 137.035999
-
-# Exponent γ in P_Q(E) = [exp(−2π·η)]^γ — the kernel tunneling formula.
-# γ = 0.02 gives the "computational tunneling" scaling used in the KQS.
-TUNNELING_GAMMA: float = 0.02
-
-# Minimum clamp for tunneling_energy_scale.abs() to prevent the effective
-# energy from collapsing toward zero (which would make η → ∞ and P_Q → 0,
-# causing a numerically unstable log loss).  0.1 keeps eff_E ≥ 10% of the
-# base TUNNELING_E_KEV, e.g. ≥12 keV at the default of 120 keV.
-TUNNELING_MIN_SCALE: float = 0.1
-
-# Small epsilon added inside log(P_Q + ε) to prevent log(0) when P_Q is
-# very close to zero at very low energies or large η values.
-TUNNELING_LOG_EPS: float = 1e-8
+NIST_D_MASS_U: float = 2.01410177812        # deuterium mass, u (NIST 2021)
+U_TO_MEV: float = 931.49410242              # u → MeV/c² (NIST CODATA 2018)
+REDUCED_MASS_DD_MEV: float = (NIST_D_MASS_U * U_TO_MEV) / 2.0  # μ = m_D/2
+ALPHA: float = 1.0 / 137.035999            # fine-structure constant
+TUNNELING_GAMMA: float = 0.02              # exponent γ in P_Q formula
+TUNNELING_MIN_SCALE: float = 0.1           # clamp on |tunneling_energy_scale|
+TUNNELING_LOG_EPS: float = 1e-8            # ε inside log(P_Q + ε)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PALINDROME PRECESSION LR FORMULA  (CriticalEigenvalue.lean §9 + §16)
@@ -413,80 +389,34 @@ _selfcheck_quantization_spec()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# COMPUTATIONAL TUNNELING FUNCTIONS  (NIST-validated D-D)
+# COMPUTATIONAL TUNNELING FUNCTIONS  (NIST-validated D-D, Q7)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def gamow_sommerfeld(E_keV: float) -> float:
-    """Exact Sommerfeld parameter η for D-D (Z₁=Z₂=1).
-
-    η(E) = 2π·α / (v/c),  where  v/c = sqrt(2·E_MeV / m_reduced).
-
-    The Sommerfeld parameter governs Coulomb-barrier penetration: higher η
-    means lower tunneling probability.  η is monotonically decreasing in E.
-
-    Args:
-        E_keV: centre-of-mass energy in keV (must be > 0).
-
-    Returns:
-        Dimensionless Sommerfeld parameter η ≥ 0.
-    """
+    """Sommerfeld parameter η(E) = 2πα / sqrt(2·E_MeV/μ) for D-D."""
     E_MeV = E_keV / 1000.0
     v_over_c = math.sqrt(2.0 * E_MeV / REDUCED_MASS_DD_MEV)
     return (2.0 * math.pi * ALPHA) / v_over_c
 
 
 def computational_tunneling_prob(E_keV: float, gamma: float = TUNNELING_GAMMA) -> float:
-    """P_Q(E) = [exp(−2π·η(E))]^{gamma} — NIST-validated kernel tunneling formula.
-
-    Evaluates the quantum tunneling probability at the Gamow peak for a D-D
-    system using the exact Sommerfeld parameter from NIST-derived constants.
-    Used both as a scalar monitoring/logging function and — via its fully
-    differentiable PyTorch analogue inside kernel_equilibrium_loss — as a
-    differentiable training regularizer.
-
-    Args:
-        E_keV: centre-of-mass energy in keV.  High-P_Q window for D-D: ≈50–200 keV.
-        gamma: exponent scaling the tunneling probability (default TUNNELING_GAMMA=0.02).
-
-    Returns:
-        Tunneling probability P_Q ∈ (0, 1].
-    """
+    """P_Q(E) = exp(−2π·η(E))^γ — D-D Gamow tunneling probability."""
     eta = gamow_sommerfeld(E_keV)
-    p_gamow_base = math.exp(-2.0 * math.pi * eta)  # standard Gamow factor exp(−2πη)
-    return p_gamow_base ** gamma
+    return math.exp(-2.0 * math.pi * eta) ** gamma
 
 
 def _selfcheck_tunneling_constants() -> None:
-    """Validate NIST tunneling constants and the computational_tunneling_prob formula.
-
-    Three essential checks only:
-      1. REDUCED_MASS_DD_MEV equals (NIST_D_MASS_U × U_TO_MEV) / 2 — catches any
-         typo in the three NIST literals simultaneously.
-      2. ALPHA matches 1/137.035999 — NIST CODATA 2018.
-      3. P_Q is in (0,1) at 120 keV and strictly increases from 50 → 200 keV —
-         confirms the formula direction (high E → more tunneling).
-
-    Runs at import time; raises AssertionError with an actionable message on any
-    violation.  Safe to run on all ranks: no I/O or distributed calls.
-    """
+    """Import-time sanity check: NIST mass, ALPHA, and P_Q monotonicity."""
     _eps = 1e-8
-
-    # Derived mass: catches typos in NIST_D_MASS_U, U_TO_MEV, and the /2 factor.
     assert abs(REDUCED_MASS_DD_MEV - (NIST_D_MASS_U * U_TO_MEV) / 2.0) < _eps, (
-        f"REDUCED_MASS_DD_MEV must equal (NIST_D_MASS_U * U_TO_MEV) / 2; "
-        f"got {REDUCED_MASS_DD_MEV:.8f}"
+        f"REDUCED_MASS_DD_MEV mismatch; got {REDUCED_MASS_DD_MEV:.8f}"
     )
-
-    # Fine-structure constant.
     assert abs(ALPHA - 1.0 / 137.035999) < _eps, (
-        f"ALPHA must equal 1/137.035999 (NIST CODATA 2018); got {ALPHA:.10f}"
+        f"ALPHA must equal 1/137.035999; got {ALPHA:.10f}"
     )
-
-    # P_Q range and monotonicity: two representative energies suffice.
     _p_lo, _p_hi = computational_tunneling_prob(50.0), computational_tunneling_prob(200.0)
     assert 0.0 < _p_lo < _p_hi <= 1.0, (
-        f"P_Q must be in (0,1] and increase with E; "
-        f"P_Q(50 keV)={_p_lo:.6f}  P_Q(200 keV)={_p_hi:.6f}"
+        f"P_Q must be in (0,1] and increase with E; P_Q(50)={_p_lo:.6f} P_Q(200)={_p_hi:.6f}"
     )
 
 
@@ -530,14 +460,7 @@ _USE_AMPLITUDE_REGULARIZER: bool = os.environ.get("USE_AMPLITUDE_REGULARIZER", "
 # On non-closure steps only the cheap (s) path (phase-advance/CE) applies.
 # Default 0 = existing always-on behavior for backward compatibility.
 _GATE_QUANT_TO_CLOSURE: bool = os.environ.get("GATE_QUANT_TO_CLOSURE", "0") == "1"
-# Computational tunneling regularizer: NIST-validated D-D Gamow factor as a
-# differentiable training regularizer (Kernel Quantization System Q7).
-# Adds a learnable tunneling_energy_scale scalar and penalises low P_Q values,
-# creating a soft incentive for the optimizer to stay in the high-tunneling-
-# probability window (≈50–200 keV for D-D).
-# Default 0 (off) — fully backward-compatible; set USE_TUNNELING_REGULARIZER=1
-# to activate.  Tune the penalty weight via TUNNELING_LAMBDA (default 0.005)
-# and the evaluation energy via TUNNELING_E_KEV (default 120.0 keV).
+# Q7 D-D tunneling regularizer (Gamow factor); off by default (USE_TUNNELING_REGULARIZER=1 to activate).
 _USE_TUNNELING_REGULARIZER: bool = os.environ.get("USE_TUNNELING_REGULARIZER", "0") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -665,25 +588,9 @@ class Hyperparameters:
     # Set to 0 to disable ramping (constant λ throughout, original behaviour).
     regularizer_warmup_steps = int(os.environ.get("REGULARIZER_WARMUP_STEPS", 300))
 
-    # ── Computational Tunneling Regularizer (Kernel Quantization System Q7) ────
-
-    # Whether to enable the NIST-validated D-D tunneling regularizer.
-    # Mirrors the module-level _USE_TUNNELING_REGULARIZER flag so that args
-    # can be passed uniformly to KernelGPT and logged together.
-    # Default False — fully backward-compatible; set USE_TUNNELING_REGULARIZER=1
-    # to activate.
+    # ── Q7 Tunneling ──────────────────────────────────────────────────────────
     use_tunneling_regularizer: bool = os.environ.get("USE_TUNNELING_REGULARIZER", "0") == "1"
-
-    # Weight of the tunneling loss term in the total KernelEquilibriumLoss:
-    #   L_tun = tunneling_lambda × (−log(P_Q(effective_E) + ε))
-    # Default 0.005 — comparable to cross_lambda; small enough to avoid
-    # dominating cross-entropy loss while still providing a meaningful signal.
     tunneling_lambda: float = float(os.environ.get("TUNNELING_LAMBDA", 0.005))
-
-    # Evaluation energy in keV at which P_Q is computed.  The learned
-    # tunneling_energy_scale scalar modulates this value during training,
-    # allowing the model to seek the high-P_Q window (≈50–200 keV for D-D).
-    # Default 120.0 keV — well within the D-D Gamow peak window.
     tunneling_e_kev: float = float(os.environ.get("TUNNELING_E_KEV", 120.0))
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1325,41 +1232,23 @@ def kernel_equilibrium_loss(
       Q4.1  Amplitude balance:    λ_a  · (2r² − 1)²
       Joint cross-term:           λ_x  · |H·T − 5π/4| · |2r² − 1|
       Phase-variance coherence:   λ_v  · Var(θ_l)
-      Q7    Tunneling (new):      λ_t  · (−log(P_Q(eff_E) + ε))
+      Q7    Tunneling:            λ_t  · (−log(P_Q(eff_E) + ε))
 
-    The cross-term is zero when *either* Q3.2 or Q4.1 is satisfied, and is
-    non-zero only when both conditions are simultaneously violated — mirroring
-    the "simultaneous validity" proved in lead_quantization_confirmed.
-
-    The phase-variance term penalises spread across the per-layer θ_l parameters,
-    encouraging all transformer blocks to converge to the same Z/8Z orbit point.
-
-    The tunneling term (Q7) implements the NIST-validated D-D Gamow factor as a
-    fully differentiable regularizer.  When tunneling_lambda > 0 and
-    tunneling_energy_scale is not None, the effective energy
-    eff_E = tunneling_e_kev × |tunneling_energy_scale| is computed in PyTorch,
-    and the corresponding tunneling probability P_Q is evaluated via the Gamow
-    formula.  Penalising −log(P_Q + ε) incentivises the optimizer to keep
-    eff_E in the high-probability window (≈50–200 keV for D-D), creating a
-    soft "tunneling incentive" that helps escape loss-landscape local minima.
-
-    NOTE: This is a soft approximation — satisfying all terms to zero would
-    imply lead_quantization_confirmed, but gradient descent only pushes toward
-    those fixed points without guaranteeing exact satisfaction.
+    NOTE: soft approximation — gradient descent pushes toward fixed points
+    without guaranteeing exact simultaneous satisfaction.
 
     Args:
-        quant_phase_thetas:    per-layer phase tensor of shape (num_layers,).
-        h_times_t:             scalar tensor for learnable Hamiltonian product H·T.
-        amplitude_r:           scalar tensor for learnable amplitude ratio η.
-        quant_lambda:          weight for the 8-cycle closure term (Q1.2).
-        drive_lambda:          weight for the Hamiltonian drive term (Q3.2).
-        amplitude_lambda:      weight for the amplitude balance term (Q4.1).
-        cross_lambda:          weight for the joint Q3.2+Q4.1 cross-term.
-        phase_variance_lambda: weight for the per-layer phase-variance term.
-        tunneling_lambda:      weight for the D-D tunneling term (Q7); 0 disables.
-        tunneling_energy_scale: learnable scalar that modulates the effective energy
-                               (eff_E = tunneling_e_kev × |scale|); None disables.
-        tunneling_e_kev:       base evaluation energy in keV (default 120.0).
+        quant_phase_thetas:     per-layer phase tensor (num_layers,).
+        h_times_t:              learnable H·T scalar tensor.
+        amplitude_r:            learnable amplitude ratio η tensor.
+        quant_lambda:           weight for Q1.2 8-cycle closure.
+        drive_lambda:           weight for Q3.2 Hamiltonian drive.
+        amplitude_lambda:       weight for Q4.1 amplitude balance.
+        cross_lambda:           weight for joint Q3.2+Q4.1 cross-term.
+        phase_variance_lambda:  weight for phase-variance coherence.
+        tunneling_lambda:       weight for Q7 tunneling (0 = disabled).
+        tunneling_energy_scale: learnable energy scale scalar; None = disabled.
+        tunneling_e_kev:        base energy in keV (default 120.0).
 
     Returns:
         Scalar non-negative regularization loss.
@@ -1384,20 +1273,11 @@ def kernel_equilibrium_loss(
         # the same orbit point; positive when they diverge.
         loss = loss + phase_variance_lambda * quant_phase_thetas.var()
     if tunneling_lambda > 0.0 and tunneling_energy_scale is not None:
-        # Q7 Computational Tunneling — NIST-validated D-D Gamow factor (Q7).
-        # Effective energy modulated by the learned scale; keeps eff_E in the
-        # high-P_Q window (≈50–200 keV for D-D where P_Q is largest).
         effective_E_kev = tunneling_e_kev * tunneling_energy_scale.abs().clamp(min=TUNNELING_MIN_SCALE)
-        # Differentiable Sommerfeld parameter η = 2πα / v_over_c (MeV units).
-        effective_E_mev = effective_E_kev / 1000.0
-        v_over_c = torch.sqrt(2.0 * effective_E_mev / REDUCED_MASS_DD_MEV)
+        v_over_c = torch.sqrt(2.0 * (effective_E_kev / 1000.0) / REDUCED_MASS_DD_MEV)
         eta_t = (2.0 * math.pi * ALPHA) / v_over_c
-        # P_Q(E) = [exp(−2πη)]^TUNNELING_GAMMA: differentiable tunneling probability.
         p_q_t = torch.exp(-2.0 * math.pi * TUNNELING_GAMMA * eta_t)
-        # Penalize low tunneling probability → optimizer incentivized toward
-        # the high-P_Q window (classical computational tunneling escape).
-        tunneling_loss = -torch.log(p_q_t + TUNNELING_LOG_EPS)
-        loss = loss + tunneling_lambda * tunneling_loss
+        loss = loss + tunneling_lambda * (-torch.log(p_q_t + TUNNELING_LOG_EPS))
     return loss
 
 
@@ -1827,12 +1707,7 @@ class KernelGPT(nn.Module):
             # Ref: Quantization.lean §4 Q4.1 (quant_amplitude_balance: 2η² = 1).
             self.amplitude_r = nn.Parameter(torch.tensor(math.sqrt(ETA_SQUARED), dtype=torch.float32))
         if use_tunneling_regularizer:
-            # Learnable scalar that modulates the effective evaluation energy for the
-            # D-D tunneling regularizer (Q7).  Initialized to 1.0 so that the initial
-            # effective energy equals tunneling_e_kev (default 120 keV) — well inside
-            # the high-P_Q window.  The differentiable Gamow-factor loss then pulls this
-            # toward values that maximize tunneling probability.
-            # Ref: Kernel Quantization System Q7; NIST D-D reduced mass constants.
+            # Learnable scale on the D-D tunneling evaluation energy (Q7); init=1 → eff_E=tunneling_e_kev.
             self.tunneling_energy_scale = nn.Parameter(torch.tensor(1.0, dtype=torch.float32))
         self._init_weights()
 
@@ -2056,15 +1931,11 @@ def main() -> None:
             "the amplitude balance condition (Q4.1 2eta^2=1) is NOT enforced "
             "during training.  Re-run with USE_AMPLITUDE_REGULARIZER=1 to activate."
         )
-    # Computational tunneling regularizer (Q7) status.
+    # Q7 tunneling status.
     log0(
-        f"quantization_spec:Q7(computational_tunneling) "
-        f"{'ENABLED' if _USE_TUNNELING_REGULARIZER else 'DISABLED (set USE_TUNNELING_REGULARIZER=1 to activate)'} "
-        f"tunneling_lambda={args.tunneling_lambda:.4f} "
-        f"tunneling_e_kev={args.tunneling_e_kev:.1f} "
-        f"gamma={TUNNELING_GAMMA} "
-        f"nist_d_mass_u={NIST_D_MASS_U} "
-        f"reduced_mass_dd_mev={REDUCED_MASS_DD_MEV:.6f}"
+        f"quantization_spec:Q7(tunneling) "
+        f"{'ENABLED' if _USE_TUNNELING_REGULARIZER else 'DISABLED'} "
+        f"lambda={args.tunneling_lambda:.4f} e_kev={args.tunneling_e_kev:.1f} gamma={TUNNELING_GAMMA}"
     )
 
     # ── Seed + tokenizer ──────────────────────────────────────────────────────
@@ -2159,15 +2030,14 @@ def main() -> None:
     if _USE_TUNNELING_REGULARIZER:
         if not hasattr(base_model, "tunneling_energy_scale"):
             raise RuntimeError(
-                "USE_TUNNELING_REGULARIZER=1 but 'tunneling_energy_scale' parameter was not found "
-                "in the model.  Check KernelGPT.__init__ for the use_tunneling_regularizer guard."
+                "USE_TUNNELING_REGULARIZER=1 but 'tunneling_energy_scale' not found; "
+                "check KernelGPT.__init__ use_tunneling_regularizer guard."
             )
         _tun_scale_init = base_model.tunneling_energy_scale.item()
         _tun_p_q_init = computational_tunneling_prob(args.tunneling_e_kev * abs(_tun_scale_init))
         log0(
-            f"quantization_spec:verified tunneling_energy_scale present "
-            f"(init={_tun_scale_init:.6f} eff_E={args.tunneling_e_kev * abs(_tun_scale_init):.1f} keV "
-            f"P_Q_init={_tun_p_q_init:.5f} lambda={args.tunneling_lambda:.4f})"
+            f"quantization_spec:verified tunneling_energy_scale "
+            f"init={_tun_scale_init:.4f} P_Q={_tun_p_q_init:.5f} lambda={args.tunneling_lambda:.4f}"
         )
 
     # fullgraph=False: allows Dynamo to fall back gracefully instead of
