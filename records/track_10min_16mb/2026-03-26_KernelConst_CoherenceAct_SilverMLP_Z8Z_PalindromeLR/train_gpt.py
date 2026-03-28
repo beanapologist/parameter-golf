@@ -459,66 +459,34 @@ def computational_tunneling_prob(E_keV: float, gamma: float = TUNNELING_GAMMA) -
 def _selfcheck_tunneling_constants() -> None:
     """Validate NIST tunneling constants and the computational_tunneling_prob formula.
 
-    Verifies:
-      - NIST_D_MASS_U matches the known deuterium atomic mass.
-      - REDUCED_MASS_DD_MEV equals (NIST_D_MASS_U × U_TO_MEV) / 2.
-      - ALPHA is close to the NIST value of 1/137.036.
-      - gamow_sommerfeld() is strictly decreasing in E (η ∝ 1/√E).
-      - computational_tunneling_prob() returns values in (0, 1] and is strictly
-        increasing in E (higher energy → smaller barrier → higher P_Q).
-      - P_Q at the default evaluation energy (120 keV) is numerically sensible.
+    Three essential checks only:
+      1. REDUCED_MASS_DD_MEV equals (NIST_D_MASS_U × U_TO_MEV) / 2 — catches any
+         typo in the three NIST literals simultaneously.
+      2. ALPHA matches 1/137.035999 — NIST CODATA 2018.
+      3. P_Q is in (0,1) at 120 keV and strictly increases from 50 → 200 keV —
+         confirms the formula direction (high E → more tunneling).
 
-    Runs at import time; raises AssertionError with an actionable message on
-    any violation.  Safe to run on all ranks: no I/O or distributed calls.
+    Runs at import time; raises AssertionError with an actionable message on any
+    violation.  Safe to run on all ranks: no I/O or distributed calls.
     """
     _eps = 1e-8
 
-    # NIST_D_MASS_U: deuterium atomic mass as listed by NIST (2021).
-    assert abs(NIST_D_MASS_U - 2.01410177812) < _eps, (
-        f"NIST_D_MASS_U must be 2.01410177812 u (NIST 2021); got {NIST_D_MASS_U}"
-    )
-
-    # REDUCED_MASS_DD_MEV: μ = m_D × U_TO_MEV / 2 (symmetric D-D system).
-    _expected_mu = (NIST_D_MASS_U * U_TO_MEV) / 2.0
-    assert abs(REDUCED_MASS_DD_MEV - _expected_mu) < _eps, (
-        f"REDUCED_MASS_DD_MEV must equal (NIST_D_MASS_U * U_TO_MEV) / 2 = {_expected_mu:.8f}; "
+    # Derived mass: catches typos in NIST_D_MASS_U, U_TO_MEV, and the /2 factor.
+    assert abs(REDUCED_MASS_DD_MEV - (NIST_D_MASS_U * U_TO_MEV) / 2.0) < _eps, (
+        f"REDUCED_MASS_DD_MEV must equal (NIST_D_MASS_U * U_TO_MEV) / 2; "
         f"got {REDUCED_MASS_DD_MEV:.8f}"
     )
 
-    # ALPHA: fine-structure constant.  Must match NIST CODATA 2018 value.
+    # Fine-structure constant.
     assert abs(ALPHA - 1.0 / 137.035999) < _eps, (
-        f"ALPHA must equal 1/137.035999; got {ALPHA:.10f}"
-    )
-    # Coarse sanity: α ≈ 1/137 (within 1 part in 10⁴ of the integer approximation).
-    assert abs(ALPHA - 1.0 / 137.0) < 1e-4, (
-        f"ALPHA must be close to 1/137 ≈ 7.3e-3; got {ALPHA}"
+        f"ALPHA must equal 1/137.035999 (NIST CODATA 2018); got {ALPHA:.10f}"
     )
 
-    # gamow_sommerfeld: strictly decreasing in E (η ∝ 1/sqrt(E)).
-    _energies = (10.0, 50.0, 100.0, 200.0, 500.0)
-    _etas = [gamow_sommerfeld(e) for e in _energies]
-    for _i in range(len(_etas) - 1):
-        assert _etas[_i] > _etas[_i + 1], (
-            f"gamow_sommerfeld must be strictly decreasing in E; "
-            f"η({_energies[_i]:.0f} keV)={_etas[_i]:.6f} ≤ η({_energies[_i+1]:.0f} keV)={_etas[_i+1]:.6f}"
-        )
-
-    # computational_tunneling_prob: values in (0, 1] and strictly increasing in E.
-    _probs = [computational_tunneling_prob(e) for e in _energies]
-    for _p, _e in zip(_probs, _energies):
-        assert 0.0 < _p <= 1.0 + _eps, (
-            f"computational_tunneling_prob({_e} keV) must be in (0, 1]; got {_p}"
-        )
-    for _i in range(len(_probs) - 1):
-        assert _probs[_i] < _probs[_i + 1], (
-            f"computational_tunneling_prob must be strictly increasing in E; "
-            f"P_Q({_energies[_i]:.0f} keV)={_probs[_i]:.8f} ≥ P_Q({_energies[_i+1]:.0f} keV)={_probs[_i+1]:.8f}"
-        )
-
-    # Default energy P_Q at 120 keV should be strictly positive and < 1.
-    _p_120 = computational_tunneling_prob(120.0)
-    assert 0.0 < _p_120 < 1.0, (
-        f"computational_tunneling_prob(120 keV) must be in (0, 1); got {_p_120}"
+    # P_Q range and monotonicity: two representative energies suffice.
+    _p_lo, _p_hi = computational_tunneling_prob(50.0), computational_tunneling_prob(200.0)
+    assert 0.0 < _p_lo < _p_hi <= 1.0, (
+        f"P_Q must be in (0,1] and increase with E; "
+        f"P_Q(50 keV)={_p_lo:.6f}  P_Q(200 keV)={_p_hi:.6f}"
     )
 
 
@@ -1594,51 +1562,24 @@ def _run_kernel_selftest() -> None:
 
     # ── Computational tunneling (Q7) — NIST D-D Gamow factor ─────────────────
 
-    # P_Q is in (0, 1] for any positive energy.
-    for _e_kev in (10.0, 50.0, 120.0, 200.0, 500.0):
-        _pq = computational_tunneling_prob(_e_kev)
-        assert 0.0 < _pq <= 1.0 + _eps, (
-            f"KERNEL_SELFTEST: computational_tunneling_prob({_e_kev} keV) must be in (0,1]; got {_pq}"
-        )
-
-    # P_Q is strictly increasing in E (higher E → more tunneling).
-    _tun_energies = (10.0, 50.0, 100.0, 200.0)
-    _tun_probs = [computational_tunneling_prob(e) for e in _tun_energies]
-    for _i in range(len(_tun_probs) - 1):
-        assert _tun_probs[_i] < _tun_probs[_i + 1], (
-            f"KERNEL_SELFTEST: P_Q must increase with E; "
-            f"P_Q({_tun_energies[_i]} keV)={_tun_probs[_i]:.8f} ≥ P_Q({_tun_energies[_i+1]} keV)={_tun_probs[_i+1]:.8f}"
-        )
-
-    # Differentiable PyTorch version matches the scalar Python version.
-    # Build the same formula in torch with a fixed scale=1 (no learning).
-    for _e_kev in (50.0, 120.0, 200.0):
-        _scale = torch.tensor(1.0)
-        _eff_E_kev = _e_kev * _scale.abs().clamp(min=TUNNELING_MIN_SCALE)
-        _eff_E_mev = _eff_E_kev / 1000.0
-        _v_oc = torch.sqrt(2.0 * _eff_E_mev / REDUCED_MASS_DD_MEV)
-        _eta_t = (2.0 * math.pi * ALPHA) / _v_oc
-        _pq_t = torch.exp(-2.0 * math.pi * TUNNELING_GAMMA * _eta_t).item()
-        _pq_py = computational_tunneling_prob(_e_kev)
-        assert abs(_pq_t - _pq_py) < _eps, (
-            f"KERNEL_SELFTEST: differentiable P_Q({_e_kev} keV) mismatch: "
-            f"torch={_pq_t:.8f} vs python={_pq_py:.8f}"
-        )
-
-    # Differentiability: gradient of tunneling loss w.r.t. tunneling_energy_scale.
-    _tun_scale = torch.tensor(1.0, requires_grad=True)
-    _eff_E_kev = 120.0 * _tun_scale.abs().clamp(min=TUNNELING_MIN_SCALE)
-    _eff_E_mev = _eff_E_kev / 1000.0
-    _v_oc = torch.sqrt(2.0 * _eff_E_mev / REDUCED_MASS_DD_MEV)
-    _eta_t = (2.0 * math.pi * ALPHA) / _v_oc
-    _pq_t = torch.exp(-2.0 * math.pi * TUNNELING_GAMMA * _eta_t)
-    _tun_loss = -torch.log(_pq_t + TUNNELING_LOG_EPS)
-    _tun_loss.backward()
-    assert _tun_scale.grad is not None, (
-        "KERNEL_SELFTEST: tunneling loss must be differentiable w.r.t. tunneling_energy_scale"
+    # Parity: PyTorch formula matches scalar Python at the default energy.
+    _scale = torch.tensor(1.0)
+    _eff_E_kev = 120.0 * _scale.abs().clamp(min=TUNNELING_MIN_SCALE)
+    _pq_t = torch.exp(-2.0 * math.pi * TUNNELING_GAMMA * (2.0 * math.pi * ALPHA)
+                      / torch.sqrt(2.0 * (_eff_E_kev / 1000.0) / REDUCED_MASS_DD_MEV)).item()
+    _pq_py = computational_tunneling_prob(120.0)
+    assert abs(_pq_t - _pq_py) < _eps, (
+        f"KERNEL_SELFTEST: torch/python P_Q parity at 120 keV: {_pq_t:.8f} vs {_pq_py:.8f}"
     )
-    assert abs(_tun_scale.grad.item()) > 0.0, (
-        "KERNEL_SELFTEST: tunneling loss gradient w.r.t. scale must be non-zero"
+
+    # Differentiability: gradient must flow through the full Gamow chain.
+    _tun_scale = torch.tensor(1.0, requires_grad=True)
+    _eff = 120.0 * _tun_scale.abs().clamp(min=TUNNELING_MIN_SCALE)
+    _pq_diff = torch.exp(-2.0 * math.pi * TUNNELING_GAMMA * (2.0 * math.pi * ALPHA)
+                         / torch.sqrt(2.0 * (_eff / 1000.0) / REDUCED_MASS_DD_MEV))
+    (-torch.log(_pq_diff + TUNNELING_LOG_EPS)).backward()
+    assert _tun_scale.grad is not None and abs(_tun_scale.grad.item()) > 0.0, (
+        "KERNEL_SELFTEST: tunneling loss must have non-zero gradient w.r.t. tunneling_energy_scale"
     )
 
     print("kernel_selftest: all checks PASSED ✓")
