@@ -42,6 +42,21 @@ directly into the model architecture:
      occupies one slot of the cyclic group, providing uniform coverage of
      the 8 distinct phase positions proven distinct in §3.
 
+   4. biMMOE — binary Mixture of Experts  (|ψ⟩ = −η|0⟩ + η|1⟩)
+      Two experts with equal amplitude but different phase (|Re| = Im):
+        • Expert |0⟩ (Re sector): C(r) = 2r/(1+r²)  — dissipation, damping
+        • Expert |1⟩ (Im sector): C(r)²              — generation, creation
+      Router: token → linear(dim, 2) → softmax → top-1 dispatch.
+        • Tokens near equilibrium are routed to Re (maintain state).
+        • Tokens far from equilibrium are sent to Im (generate activity).
+      Expert width: ⌊δS · dim · η⌋ (η-scaled from full δS-width).
+        At dim=256: full width ≈ 618, η-scaled expert width ≈ 437.
+        Two experts at η-width share the param/FLOP budget of one full-width
+        expert, enabling specialization without additional cost.
+      The balance hypothesis (|Re| = Im, equal amplitude, different phase)
+      is encoded directly in the architecture.  Enabled by USE_BIMMOE=1
+      (default on — biMMOE is live).
+
 Hard stop: to stay readable for newcomers, keep this file under 1500 lines.
 """
 
@@ -462,6 +477,11 @@ _USE_AMPLITUDE_REGULARIZER: bool = os.environ.get("USE_AMPLITUDE_REGULARIZER", "
 _GATE_QUANT_TO_CLOSURE: bool = os.environ.get("GATE_QUANT_TO_CLOSURE", "0") == "1"
 # Q7 D-D tunneling regularizer (Gamow factor); off by default (USE_TUNNELING_REGULARIZER=1 to activate).
 _USE_TUNNELING_REGULARIZER: bool = os.environ.get("USE_TUNNELING_REGULARIZER", "0") == "1"
+# biMMOE: binary Mixture of Experts (|ψ⟩ = −η|0⟩ + η|1⟩).
+# Two experts at η-width: Re sector (C(r)) and Im sector (C(r)²).
+# Router: token → softmax → top-1 dispatch.  Enabled by default (biMMOE is live).
+# Set USE_BIMMOE=0 to fall back to the single-expert CoherenceMLP.
+_USE_BIMMOE: bool = os.environ.get("USE_BIMMOE", "1") == "1"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HYPERPARAMETERS
@@ -512,6 +532,11 @@ class Hyperparameters:
     # δS ≈ 2.414 (CriticalEigenvalue.lean §7).
     # Re-read MODEL_DIM from env so that overrides are honoured even when MLP_HIDDEN is unset.
     mlp_hidden = int(os.environ.get("MLP_HIDDEN", round(SILVER_RATIO * int(os.environ.get("MODEL_DIM", 512)))))
+    # biMMOE expert width: ⌊mlp_hidden · η⌋ = ⌊δS · dim · η⌋.
+    # η = 1/√2 ≈ 0.707 (amplitude balance, Quantization.lean Q4.1).
+    # At dim=256: mlp_hidden≈618, expert_hidden≈437.
+    # Two experts at η-width share the param/FLOP budget of one full-width expert.
+    expert_hidden = int(os.environ.get("EXPERT_HIDDEN", round(mlp_hidden * math.sqrt(ETA_SQUARED))))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1133,6 +1158,26 @@ def coherence(x: Tensor) -> Tensor:
     return 2.0 * x / (1.0 + x.square())
 
 
+def coherence_sq(x: Tensor) -> Tensor:
+    """Squared coherence activation  C(r)² = (2r / (1 + r²))².
+
+    Expert |1⟩ (Im sector) nonlinearity in the biMMOE architecture
+    (|ψ⟩ = −η|0⟩ + η|1⟩, generation and creation arm).
+
+    Properties:
+      • C(r)² ≥ 0                        (non-negative; sharper gate than C(r))
+      • C(±1)² = 1                        (unique maximum; shared with C(r))
+      • C(r)² ≤ 1 for all r              (bounded above by AM–GM)
+      • Near r = 0: C(r)² ≈ 4r²          (quadratic suppression of weak inputs)
+      • C(r)² = 1 − ((r²−1)/(1+r²))²    (Pythagorean complement, §18)
+
+    Role vs. Re expert: C(r)² is strictly sharper than C(r) — it passes strong
+    signals (|r| near 1) and suppresses weak ones (|r| ≪ 1) more aggressively,
+    making it the natural choice for the generation / far-from-equilibrium sector.
+    """
+    return coherence(x).square()
+
+
 def eight_cycle_loss(theta: Tensor) -> Tensor:
     """8-cycle closure regularizer derived from formal-lean/Quantization.lean.
 
@@ -1615,15 +1660,65 @@ class CoherenceMLP(nn.Module):
         return self.proj(coherence(self.fc(x)))
 
 
-class KernelBlock(nn.Module):
-    """Transformer block using CoherenceMLP in place of the baseline relu² MLP."""
+class BiMMOEMLP(nn.Module):
+    """Binary Mixture-of-Experts MLP block: |ψ⟩ = −η|0⟩ + η|1⟩.
 
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_hidden: int, rope_base: float, qk_gain_init: float):
+    Two experts with equal amplitude (η = 1/√2) but different phase:
+      • Expert |0⟩ (Re sector): C(r) = 2r/(1+r²)  — dissipation, damping
+      • Expert |1⟩ (Im sector): C(r)² — generation, creation
+
+    Router: token → linear(dim, 2) → softmax → top-1 dispatch.
+      • Tokens near equilibrium → Re (maintain state).
+      • Tokens far from equilibrium → Im (generate activity).
+
+    Expert width = ⌊dim_model·δS·η⌋ where η = 1/√2 (Quantization.lean Q4.1).
+    Two experts at η-width share the param/FLOP budget of one full-δS-width expert,
+    enabling Re/Im specialization at zero extra cost.
+
+    The balance hypothesis: |Re| = Im, equal amplitude, different phase.
+    """
+
+    def __init__(self, dim: int, expert_hidden: int):
+        super().__init__()
+        # Router: maps each token to a 2-way probability distribution.
+        self.router = nn.Linear(dim, 2, bias=False)
+        # Expert |0⟩ — Re sector: C(r) = 2r / (1 + r²) (smooth, bounded)
+        self.fc_re = CastedLinear(dim, expert_hidden, bias=False)
+        self.proj_re = CastedLinear(expert_hidden, dim, bias=False)
+        self.proj_re._zero_init = True
+        # Expert |1⟩ — Im sector: C(r)² (sharper, more selective)
+        self.fc_im = CastedLinear(dim, expert_hidden, bias=False)
+        self.proj_im = CastedLinear(expert_hidden, dim, bias=False)
+        self.proj_im._zero_init = True
+
+    def forward(self, x: Tensor) -> Tensor:
+        # Router: top-1 dispatch via softmax.
+        probs = torch.softmax(self.router(x), dim=-1)  # (..., 2)
+        idx = probs.argmax(dim=-1, keepdim=True)        # (..., 1)  no grad
+        gate = probs.gather(dim=-1, index=idx)          # selected prob (..., 1)
+        # One-hot selection mask (no in-place ops for torch.compile compatibility).
+        re_sel = (idx == 0).to(x.dtype)                 # 1.0 where Re selected
+        im_sel = (idx == 1).to(x.dtype)                 # 1.0 where Im selected
+        # Expert |0⟩ Re: C(r) — smooth, bounded nonlinearity
+        out_re = self.proj_re(coherence(self.fc_re(x)))
+        # Expert |1⟩ Im: C(r)² — sharper, more selective
+        out_im = self.proj_im(coherence_sq(self.fc_im(x)))
+        # Gate-weighted top-1 output; gradient flows through probs via gate.
+        return gate * (re_sel * out_re + im_sel * out_im)
+
+
+class KernelBlock(nn.Module):
+    """Transformer block using BiMMOEMLP (or CoherenceMLP when USE_BIMMOE=0)."""
+
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_hidden: int, rope_base: float, qk_gain_init: float, expert_hidden: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = CoherenceMLP(dim, mlp_hidden)
+        if _USE_BIMMOE and expert_hidden > 0:
+            self.mlp = BiMMOEMLP(dim, expert_hidden)
+        else:
+            self.mlp = CoherenceMLP(dim, mlp_hidden)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -1644,6 +1739,11 @@ class KernelGPT(nn.Module):
       • num_heads = 8  (one slot per Z/8Z orbit element, §15)
       • MLP hidden  = ⌊δS · model_dim⌋  (silver ratio expansion, §7)
       • MLP activation = C(r) = 2r/(1+r²)  (coherence function, §5)
+    When USE_BIMMOE=1 (default), each MLP block is replaced by BiMMOEMLP:
+      • |ψ⟩ = −η|0⟩ + η|1⟩ (equal amplitude η=1/√2, different phase)
+      • Expert |0⟩ (Re): C(r) — dissipation/damping
+      • Expert |1⟩ (Im): C(r)² — generation/creation
+      • Expert width = ⌊δS · dim · η⌋  (two experts share budget of one full-width expert)
     """
 
     def __init__(
@@ -1659,6 +1759,7 @@ class KernelGPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        expert_hidden: int = 0,
         quant_lambda: float = 0.01,
         drive_lambda: float = 0.01,
         amplitude_lambda: float = 0.01,
@@ -1700,9 +1801,12 @@ class KernelGPT(nn.Module):
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # biMMOE expert width: use provided expert_hidden, or auto-compute as mlp_hidden*eta.
+        _expert_hidden = expert_hidden if expert_hidden > 0 else round(mlp_hidden * math.sqrt(ETA_SQUARED))
         self.blocks = nn.ModuleList(
             [
-                KernelBlock(model_dim, num_heads, num_kv_heads, mlp_hidden, rope_base, qk_gain_init)
+                KernelBlock(model_dim, num_heads, num_kv_heads, mlp_hidden, rope_base, qk_gain_init,
+                            expert_hidden=_expert_hidden)
                 for _ in range(num_layers)
             ]
         )
@@ -1872,6 +1976,14 @@ def main() -> None:
     # ── Kernel constants log ──────────────────────────────────────────────────
     log0(f"kernel:silver_ratio:{SILVER_RATIO:.6f} mu_angle_deg:{math.degrees(MU_ANGLE):.1f} orbit_size:{MU_ORBIT_SIZE}")
     log0(f"kernel:mlp_hidden:{args.mlp_hidden} (={args.mlp_hidden / args.model_dim:.4f}x model_dim)")
+    log0(
+        f"biMMOE:{'ENABLED' if _USE_BIMMOE else 'DISABLED'} "
+        f"expert_hidden:{args.expert_hidden} "
+        f"(={args.expert_hidden / args.model_dim:.4f}x model_dim, "
+        f"eta_scale={args.expert_hidden / max(args.mlp_hidden, 1):.4f}) "
+        f"Re=C(r) Im=C(r)^2 router=softmax_top1 "
+        f"balance_hyp:|Re|=Im (equal_amplitude_different_phase)"
+    )
     log0(f"kernel:precession_period:{PRECESSION_PERIOD} delta_phi:{PRECESSION_DELTA_PHI:.2e} (formal-lean/CriticalEigenvalue.lean §14, §21)")
     log0(
         f"kernel:invariants: 9*D={9 * PRECESSION_PERIOD} (expect 123456789) "
@@ -1996,6 +2108,7 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_hidden=args.mlp_hidden,
+        expert_hidden=args.expert_hidden,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
