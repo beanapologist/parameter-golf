@@ -1694,21 +1694,28 @@ class BiMMOEMLP(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         # Router: top-1 dispatch via softmax.
         probs = torch.softmax(self.router(x), dim=-1)  # (..., 2)
-        idx = probs.argmax(dim=-1, keepdim=True)        # (..., 1)  no grad
+        # argmax is non-differentiable; gradient flows through gate (probs.gather)
+        # so the router learns via the selected expert's probability weight.
+        idx = probs.argmax(dim=-1, keepdim=True)        # (..., 1)
         gate = probs.gather(dim=-1, index=idx)          # selected prob (..., 1)
-        # One-hot selection mask (no in-place ops for torch.compile compatibility).
+        # One-hot Re-sector mask; Im mask = 1 - re_sel (saves an allocation).
         re_sel = (idx == 0).to(x.dtype)                 # 1.0 where Re selected
-        im_sel = (idx == 1).to(x.dtype)                 # 1.0 where Im selected
         # Expert |0⟩ Re: C(r) — smooth, bounded nonlinearity
         out_re = self.proj_re(coherence(self.fc_re(x)))
         # Expert |1⟩ Im: C(r)² — sharper, more selective
         out_im = self.proj_im(coherence_sq(self.fc_im(x)))
         # Gate-weighted top-1 output; gradient flows through probs via gate.
-        return gate * (re_sel * out_re + im_sel * out_im)
+        return gate * (re_sel * out_re + (1.0 - re_sel) * out_im)
 
 
 class KernelBlock(nn.Module):
-    """Transformer block using BiMMOEMLP (or CoherenceMLP when USE_BIMMOE=0)."""
+    """Transformer block using BiMMOEMLP (or CoherenceMLP when USE_BIMMOE=0).
+
+    Args:
+        expert_hidden: η-scaled expert hidden width for BiMMOEMLP.  When 0
+            (default), falls back to CoherenceMLP regardless of _USE_BIMMOE.
+            KernelGPT computes this as round(mlp_hidden * sqrt(ETA_SQUARED)).
+    """
 
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_hidden: int, rope_base: float, qk_gain_init: float, expert_hidden: int = 0):
         super().__init__()
